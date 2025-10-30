@@ -1,525 +1,548 @@
-"""==================================================================================================================================================
-文件名: check_obs.py
-
-功能描述:
-该文件定义了一个通用的 MeltingPot 环境封装器 `MeltingPotPettingZooParallelWrapper`，用于将 MeltingPot 环境适配为 PettingZoo 的并行环境接口。主要功能包括：
-
-1. **支持两种模式**:
-   - `self_play` 模式：加载 MeltingPot 的 Substrate 环境。
-   - `mixed_control` 模式：加载 MeltingPot 的 Scenario 环境。
-
-2. **动态处理观测和信息**:
-   - 将非标准的、全局的观测键（如 `WORLD.RGB`）移至 `info` 字典。
-   - 仅保留标准的、局部的智能体观测键（如 `RGB`, `HUNGER` 等）。
-
-3. **动态生成空间**:
-   - 根据 MeltingPot 环境的 `dm_env` 规范动态生成 `observation_space` 和 `action_space`，避免硬编码。
-
-4. **渲染支持**:
-   - 支持 `human` 和 `rgb_array` 两种渲染模式。
-   - 使用 Pygame 实现人类可视化渲染。
-
-5. **PettingZoo API**:
-   - 实现了 `reset`、`step`、`render` 和 `close` 等标准接口，方便与 PettingZoo 框架集成。
-
-6. **测试功能**:
-   - 提供了测试代码，验证封装器在不同场景和模式下的功能，包括环境重置、步进、观测和信息的正确性检查，以及渲染功能。
-
-该封装器代码具有较强的通用性，支持不同的 MeltingPot 场景和模式，适用于强化学习实验中的多智能体环境适配。
-=================================================================================================================================================="""
-
-import dm_env
-import numpy as np
-from gymnasium import spaces
-import gymnasium as gym
-import time
-import pygame
-
-from pettingzoo.utils.env import ParallelEnv
-from meltingpot import substrate as mp_substrate
-from meltingpot import scenario as mp_scenario
-from pettingzoo.utils import parallel_to_aec
 import logging
-logging.getLogger('absl').setLevel(logging.ERROR) # 抑制 absl 的 INFO 日志
+logging.getLogger('absl').setLevel(logging.ERROR)
 
-class MeltingPotPettingZooParallelWrapper(ParallelEnv):
+import numpy as np
+import dm_env
+from dm_env import specs
+from typing import Dict, List, Any, Tuple
+import pygame
+import time
+
+from meltingpot import substrate
+from meltingpot import scenario
+
+from meltingpot.configs import substrates as substrate_configs
+from meltingpot.configs import scenarios as scenario_configs
+
+class _SubstrateWrapper:
     """
-    该类是一个通用的封装器，用于将 MeltingPot 环境适配为 PettingZoo 的并行环境接口。
-    支持 `self_play` 和 `mixed_control` 两种模式，动态处理观测和动作空间，支持渲染功能，
-    并实现了 PettingZoo 的标准 API（如 `reset`、`step` 和 `render`）。适用于多智能体强化学习实验。
+    Wraps a Melting Pot Substrate environment.
+
+        - Provides access to *all* agents
+        - Requires an action dictionary containing actions for *all* agents
     """
     
-    metadata = {"render_modes": ["human", "rgb_array"], "name": "MeltingPot"}
+    def __init__(self, substrate_name: str):
+        print(f"[Wrapper] Initializing Substrate: {substrate_name}...")
 
-    def __init__(self, level_name: str, mode: str = "self_play", 
-                 render_mode: str = None):
-        super().__init__()
+        # 1. Load substrate config
+        self.substrate_name = substrate_name                        # substrate name
+        self._config = substrate.get_config(self.substrate_name)    # substrate config
 
-        self.mode = mode                      # "self_play" 或 "mixed_control"
-        self.level_name = level_name          # MeltingPot 场景名称
-        self._mp_env = None                   # 内部 MeltingPot 环境
-        self.latest_global_rgb = None         # 最新的全局渲染帧
+        # 2. Get player roles and agent IDs
+        self._roles = self._config.default_player_roles                # player roles
+        self.n_agents = len(self._roles)                               # number of agents
+        self.agent_ids = [f"player_{i}" for i in range(self.n_agents)] # agent IDs
+
+        # 3. Get action space
+        self._action_set = self._config.action_set                 # action set
+        self.n_actions = len(self._action_set)                     # number of actions (discrete)
+
+        # 4. Build the underlying Melting Pot environment
+        self._env = substrate.build_from_config(self._config, roles=self._roles)
+
+        # 5. Get episode length limit
+        lab2d_settings = self._config.lab2d_settings_builder(     # get lab2d settings
+            roles=self._roles, config=self._config
+        )
+        self.episode_limit = lab2d_settings.get("maxEpisodeLengthFrames", 1000) # episode limit
+        self._step_count = 0
+
+        # 6. Get observation space (specifically RGB and WORLD.RGB)
+        self._obs_spec = self._config.timestep_spec.observation["RGB"] 
+        self._render_spec = self._config.timestep_spec.observation["WORLD.RGB"]
         
-        self.render_mode = render_mode        # None, "human", 或 "rgb_array"
-        self.screen = None                    # Pygame 窗口
-        self.clock = None                     # Pygame 时钟
-        self.screen_size = None               # 渲染屏幕大小
+        self.obs_shape = (
+            self._obs_spec.shape[2], 
+            self._obs_spec.shape[0], 
+            self._obs_spec.shape[1]
+        )
+        self._obs_size = np.prod(self.obs_shape)            # single agent obs size (H * W * C)
+        self.state_shape = self.n_agents * self._obs_size   # global state size (n_agents * H * W * C)
+
+        self.render_shape = self._render_spec.shape         # (H, W, C)
+
+        self._last_timestep = None
+        print(f"[Wrapper] Substrate initialization complete. N_Agents = {self.n_agents}")
+
+    def get_env_info(self) -> dict:
+        info = {
+            "n_agents": self.n_agents,              # number of agents
+            "n_actions": self.n_actions,            # number of actions
+            "agent_ids": self.agent_ids,            # agent IDs
+            "obs_shape": self.obs_shape,            # observation shape
+            "state_shape": self.state_shape,        # state shape
+            "render_shape": self.render_shape,      # render shape
+            "episode_limit": self.episode_limit      # episode limit
+        }
+        return info
+
+    def _preprocess_obs(self, obs_dict: dict) -> np.ndarray:
+        """ Preprocess observation dictionary:
+            - Convert 'RGB' to (C, H, W) and normalize
+        """
+        processed_obs = {}            # dictionary to hold processed observations                                  
+        if 'RGB' in obs_dict:         # process RGB
+            obs_rgb = obs_dict['RGB'].astype(np.float32)  
+            obs_rgb /= 255.0                              
+            processed_obs['RGB'] = np.transpose(obs_rgb, (2, 0, 1))   
         
-        self.global_render_key = "WORLD.RGB"  # 全局渲染观测键
+        if 'COLLECTIVE_REWARD' in obs_dict:  # retain collective reward if exists
+            processed_obs['COLLECTIVE_REWARD'] = obs_dict['COLLECTIVE_REWARD']
         
-        self.PERMITTED_LOCAL_OBSERVATIONS = frozenset({    # 允许的局部观测键
-            'RGB', 'HUNGER', 'INVENTORY', 'MY_OFFER', 'OFFERS',
-            'READY_TO_SHOOT', 'STAMINA', 'VOTING'
-        })
-        
-        if self.mode == "self_play":
-            # 如果模式为 "self_play"（自博弈模式），加载 MeltingPot 的 Substrate 环境。
-            # 1. 根据关卡名称获取配置（config），并提取默认玩家角色（roles）。
-            # 2. 使用配置和角色构建 Substrate 环境。
-            # 3. 设置智能体数量为角色数量。
-            print(f"模式: 'self_play'。加载 Substrate: '{self.level_name}'")
-            self.config = mp_substrate.get_config(self.level_name)
-            self.roles = self.config.default_player_roles
-            self._mp_env = mp_substrate.build(self.level_name, roles=self.roles)
-            num_agents = len(self.roles)
-        
-        elif self.mode == "mixed_control":
-            # 如果模式为 "mixed_control"（混合控制模式），加载 MeltingPot 的 Scenario 环境。
-            # 1. 根据关卡名称获取配置（config）。
-            # 2. 应用一个空的 substrate_transform，确保保留全局渲染键（如 "WORLD.RGB"）用于渲染。
-            # 3. 使用配置构建 Scenario 环境。
-            # 4. 设置智能体数量为可控智能体（Focal agents）的数量。
-            print(f"模式: 'mixed_control'。加载 Scenario: '{self.level_name}'")
-            self.config = mp_scenario.get_config(self.level_name)
+        return processed_obs
+
+    def get_obs(self) -> Dict[str, np.ndarray]:
+        """ Get observations for all agents as a dictionary. """
+        if self._last_timestep is None:
+            raise RuntimeError("Must call reset() before calling get_obs()")
             
-            dummy_transform = lambda substrate: substrate
-            print("  > 正在应用 'substrate_transform' 以保留 'WORLD.RGB' 用于渲染。")
-            self._mp_env = mp_scenario.build(
-                self.level_name, 
-                substrate_transform=dummy_transform
+        agent_observations_list = self._last_timestep.observation  # list of observations for all agents
+        
+        obs_dict = {}                                    # dictionary to hold processed observations
+        for i, agent_id in enumerate(self.agent_ids):    # iterate over agents
+            obs_dict[agent_id] = self._preprocess_obs(
+                agent_observations_list[i]
             )
+        return obs_dict                                  # return the observation dictionary
+
+    def get_state(self) -> np.ndarray:
+        """ Get global state (flattened concatenation of all 'RGB' observations). """
+        obs_dict = self.get_obs()   # get observations dictionary
+        # Extract only the RGB parts to construct the global state
+        obs_list = [obs_dict[agent_id]['RGB'] for agent_id in self.agent_ids if 'RGB' in obs_dict[agent_id]]
+        if not obs_list:            # if obs_list is empty
+            return np.array([])  
             
-            num_agents = sum(self.config.is_focal)
-            print(f"  总角色数: {len(self.config.roles)}")
-            print(f"  可控智能体 (Focal): {num_agents}")
-        
-        else:
-            raise ValueError(f"未知的 mode: '{mode}'")
+        obs_stack = np.stack(obs_list, axis=0)    # stack along new axis
+        state = obs_stack.flatten()               # flatten to 1D array
+        return state                                                
 
-        self.possible_agents = [f"player_{i}" for i in range(num_agents)]       # 智能体名称列表
-        self.agents = self.possible_agents[:]                                   # 当前活跃智能体列表
+    def reset(self) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+        """ Reset the environment and return initial observations and state. """
+        self._step_count = 0
+        self._last_timestep = self._env.reset()
+        return self.get_obs(), self.get_state()
 
-        self._mp_action_specs = self._mp_env.action_spec()                      # MeltingPot 动作规范
-        self._mp_obs_specs = self._mp_env.observation_spec()                    # MeltingPot 观测规范
+    def step(self, actions_dict: Dict[str, int]) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
+        """ Take a step in the environment using the provided actions dictionary. """
+        actions_list = [actions_dict[agent_id] for agent_id in self.agent_ids] # convert dict to list
+        self._last_timestep = self._env.step(actions_list)                     # take a step
+        self._step_count += 1                                                  # increment step count
         
-        self._set_screen_size()                                                 # 设置渲染屏幕大小
+        rewards_dict = {}                                 # dictionary for rewards
+        dones_dict = {}                                   # dictionary for done flags
+
+        agent_rewards_list = self._last_timestep.reward   # list of rewards for all agents
         
-        self.action_spaces = {                                                  # 动作空间字典
-            agent: self._convert_spec_to_space(self._mp_action_specs[i])
-            for i, agent in enumerate(self.possible_agents)
+        global_done = False
+        if self._step_count >= self.episode_limit:        # check episode limit
+            global_done = True
+        elif self._last_timestep.last():                  # check if episode ended
+            global_done = True
+
+        for i, agent_id in enumerate(self.agent_ids):
+            rewards_dict[agent_id] = agent_rewards_list[i]  # assign rewards
+            dones_dict[agent_id] = global_done              # assign done flags
+            
+        next_obs_dict = self.get_obs()                      # get next observations
+        next_state = self.get_state()                       # get next state
+        info_dict = {}                                      # empty info dictionary
+        
+        return next_obs_dict, next_state, rewards_dict, dones_dict, info_dict
+
+    def render(self) -> np.ndarray:
+        """ Render the current environment state as an RGB array. """
+        if self._last_timestep is None:
+            raise RuntimeError("Must call reset() before calling render()")
+        obs_list = self._env.observation()
+        if not obs_list:
+            raise ValueError("self._env.observation() returned an empty list.")
+        obs_dict = obs_list[0]           # we get WORLD.RGB from the first element (dict) of the list
+
+        if 'WORLD.RGB' not in obs_dict:
+            raise KeyError("Could not find 'WORLD.RGB' in self._env.observation()[0].")
+
+        return obs_dict['WORLD.RGB']
+    
+    def close(self):
+        self._env.close()
+
+class _ScenarioWrapper:
+    """
+    Encapsulates a Melting Pot Scenario environment.
+
+    - Only exposes *focal* agents (the learning agents)
+    - Requires an action dictionary containing only *focal* agent actions  
+    - Handles bot actions automatically internally
+    - Maintains API compatibility with _SubstrateWrapper
+    """
+    
+    def __init__(self, scenario_name: str):
+        print(f"[Wrapper] Initializing Scenario: {scenario_name}...")
+        self.scenario_name = scenario_name
+
+        # 1. Load scenario config (needed to get is_focal etc.)
+        self._config = scenario.get_config(self.scenario_name)
+
+        # 2. Build the underlying Melting Pot *scenario* environment
+        self._env = scenario.build(self.scenario_name)
+
+        # 3. Identify *focal* agents
+        self._roles = self._config.roles                   # player roles
+        self._is_focal = self._config.is_focal             # focal agent flags
+        
+        self.agent_ids = []                                # list of focal agent IDs
+        self._focal_agent_indices = []                     # indices of focal agents in the full env
+        for i, is_focal in enumerate(self._is_focal):      # iterate over agents
+            if is_focal:
+                self.agent_ids.append(f"player_{i}")       # add focal agent ID
+                self._focal_agent_indices.append(i)        # add focal agent index
+                
+        self.n_agents = len(self.agent_ids)                # number of focal agents
+
+        # 4. Get action and observation spaces (only for focal agents)
+        self._action_spec_list = self._env.action_spec()        # list of action specs
+        self._obs_spec_list = self._env.observation_spec()      # list of observation specs
+        
+        self.n_actions = self._action_spec_list[0].num_values   # assume all focal agents have same action space
+        
+        obs_spec_rgb = self._obs_spec_list[0]["RGB"]       # assume all focal agents have same obs space
+        self.obs_shape = (
+            obs_spec_rgb.shape[2], 
+            obs_spec_rgb.shape[0], 
+            obs_spec_rgb.shape[1]
+        )
+        self._obs_size = np.prod(self.obs_shape)            # single focal agent obs size (H * W * C)
+        self.state_shape = self.n_agents * self._obs_size   # global state size (n_focal_agents * H * W * C)
+
+        # 5. Get episode length limit
+        self._substrate_config = substrate.get_config(self._config.substrate)   # substrate config
+        self._substrate_roles = self._substrate_config.default_player_roles     # substrate roles
+        
+        lab2d_settings = self._substrate_config.lab2d_settings_builder(         # get lab2d settings
+            roles=self._substrate_roles, config=self._substrate_config
+        )
+        self.episode_limit = lab2d_settings.get("maxEpisodeLengthFrames", 1000)
+        self._step_count = 0
+
+        self._render_spec = self._substrate_config.timestep_spec.observation["WORLD.RGB"]
+        self.render_shape = self._render_spec.shape         # (H, W, C)
+
+        self._last_timestep = None
+        print(f"[Wrapper] Scenario initialization finished. N_Agents = {self.n_agents} (focal agents only)")
+
+    def get_env_info(self) -> dict:
+        info = {
+            "n_agents": self.n_agents,              # number of agents
+            "n_actions": self.n_actions,            # number of actions
+            "agent_ids": self.agent_ids,            # agent IDs
+            "obs_shape": self.obs_shape,            # observation shape
+            "state_shape": self.state_shape,        # state shape
+            "render_shape": self.render_shape,      # render shape
+            "episode_limit": self.episode_limit    # episode limit
         }
-        self.observation_spaces = {                                             # 观测空间字典
-            agent: self._convert_obs_spec_to_space(self._mp_obs_specs[i])
-            for i, agent in enumerate(self.possible_agents)
-        }
+        return info
 
-    def _set_screen_size(self):
+    def _preprocess_obs(self, obs_dict: dict) -> np.ndarray:
         """
-        该方法用于设置渲染屏幕的大小。通过检查第一个智能体的观测规范，提取全局渲染键 (`WORLD.RGB`) 的形状来确定屏幕尺寸。
-        如果未找到全局渲染键或发生错误，则屏幕大小设置失败。
-
-        主要步骤:
-        1. 检查是否存在观测规范 (`_mp_obs_specs`)。
-        2. 提取第一个智能体的观测规范，检查是否包含全局渲染键。
-        3. 如果找到全局渲染键，获取其形状并设置屏幕大小。
-        4. 如果未找到全局渲染键或发生异常，打印警告或错误信息。
+        Preprocessing the observation dictionary:
+        - Transform 'RGB' to (C, H, W) format and normalize
+        - Retain 'COLLECTIVE_REWARD' unchanged if it exists
         """
-        if not self._mp_obs_specs: return
-        try:
-            first_agent_spec = self._mp_obs_specs[0]
-            if self.global_render_key in first_agent_spec:
-                shape = first_agent_spec[self.global_render_key].shape
-                self.screen_size = (shape[1], shape[0])
-                print(f"  > 渲染屏幕大小设置为: {self.screen_size}")
-            else:
-                print(f"警告: '{self.global_render_key}' 不在观测规范中。渲染将不可用。")
-        except Exception as e:
-            print(f"设置屏幕大小时出错: {e}")
+        processed_obs = {}
 
-    def _convert_spec_to_space(self, spec) -> spaces.Space:
-        """
-        该方法将 MeltingPot 环境中的 `dm_env` 规范转换为 `gymnasium` 的空间对象 (`spaces.Space`)。
-        根据输入的 `spec` 类型，动态生成对应的动作或观测空间。
-
-        主要步骤:
-        1. 如果 `spec` 是 `DiscreteArray` 类型，则转换为离散空间 (`spaces.Discrete`)。
-        2. 如果 `spec` 是 `BoundedArray` 类型，则转换为有界连续空间 (`spaces.Box`)，并根据最小值和最大值设置边界。
-        3. 如果 `spec` 是 `Array` 类型，则根据数据类型生成无界连续空间或其他适配的空间。
-        4. 如果 `spec` 是字典类型，则递归调用自身，将每个键值对转换为对应的空间，并生成字典空间 (`spaces.Dict`)。
-        5. 如果 `spec` 类型未知，则抛出异常。
-
-        用途:
-            该方法用于动态适配 MeltingPot 环境的动作和观测规范，确保与 PettingZoo 的空间定义兼容。
-        """
-        if isinstance(spec, dm_env.specs.DiscreteArray):                                # 离散空间
-            return spaces.Discrete(spec.num_values)                                     
-        elif isinstance(spec, dm_env.specs.BoundedArray):                               # 有界连续空间
-            low, high = spec.minimum, spec.maximum
-            if np.isscalar(low): low = np.full(spec.shape, low)                             # 扩展标量到数组
-            if np.isscalar(high): high = np.full(spec.shape, high)                          # 扩展标量到数组
-            return spaces.Box(low=low, high=high, shape=spec.shape, dtype=spec.dtype)
-        elif isinstance(spec, dm_env.specs.Array):                                      # 无界连续空间或其他
-            if np.issubdtype(spec.dtype, np.floating):                                      # 浮点类型
-                return spaces.Box(-np.inf, np.inf, spec.shape, spec.dtype)
-            elif np.issubdtype(spec.dtype, np.uint8):                                       # 无符号整数类型
-                return spaces.Box(0, 255, spec.shape, spec.dtype)
-            else:                                                                           # 其他整数类型
-                 return spaces.Box(np.iinfo(spec.dtype).min, np.iinfo(spec.dtype).max, spec.shape, spec.dtype)
-        elif isinstance(spec, dict):                                                    # 字典类型
-            return spaces.Dict({k: self._convert_spec_to_space(v) for k, v in spec.items()})
-        else:                                                                           # 其他类型
-            raise ValueError(f"未知的 dm_env spec 类型: {type(spec)}") 
-
-    def _convert_obs_spec_to_space(self, spec: dict) -> spaces.Dict:
-        """
-        该方法将 MeltingPot 环境中的观测规范 (`dm_env` 格式) 转换为 `gymnasium` 的字典空间 (`spaces.Dict`)。
-        仅为允许的局部观测键（如 `RGB`, `HUNGER` 等）创建空间，忽略全局渲染键和其他非标准键。
-
-        主要步骤:
-        1. 遍历输入的观测规范字典 `spec`。
-        2. 如果键是全局渲染键（如 `WORLD.RGB`），跳过处理。
-        3. 如果键在允许的局部观测键列表中（`PERMITTED_LOCAL_OBSERVATIONS`），将其添加到新的空间字典中。
-        4. 返回包含允许键的 `spaces.Dict` 对象。
-
-        用途:
-            该方法用于动态生成局部观测空间，确保仅包含标准的局部观测键，同时忽略全局渲染键和其他非标准键。
-        """
-        new_spec_dict = {}                                                     # 新的观测空间字典
-        for key, value_spec in spec.items():                                   # 遍历观测规范
-            if key == self.global_render_key:                                  # 如果是全局渲染键，跳过
-                continue
-            if key in self.PERMITTED_LOCAL_OBSERVATIONS:                       # 仅保留允许的局部观测键
-                new_spec_dict[key] = self._convert_spec_to_space(value_spec)   # 转换并添加到新字典
-         
-        return spaces.Dict(new_spec_dict)                                      # 返回字典空间
-
-    def _process_obs_and_info(self, mp_obs_list: list) -> tuple[dict, dict]:
-        """
-        该方法用于处理 MeltingPot 环境返回的观测列表，将观测数据拆分为标准的局部观测 (`obs`) 和附加信息 (`info`) 两部分。
-        全局渲染键（如 `WORLD.RGB`）和其他非标准键会被移至 `info`，仅保留允许的局部观测键。
-
-        主要步骤:
-        1. 提取全局渲染观测（如 `WORLD.RGB`），并将其存储在 `info` 的 `global_obs` 中。
-        2. 遍历每个智能体的观测数据：
-            - 如果键是全局渲染键，跳过处理（已在全局信息中处理）。
-            - 如果键是允许的局部观测键（如 `RGB`, `HUNGER` 等），将其保留在 `obs` 中。
-            - 其他键（如 `COLLECTIVE_REWARD` 等）会被移至 `info`。
-        3. 返回两个字典：
-            - `obs`：包含每个智能体的局部观测。
-            - `info`：包含每个智能体的附加信息和全局观测。
-
-        用途:
-            该方法确保观测数据的标准化处理，便于强化学习算法使用，同时保留额外信息供调试或分析。
-        """
-        all_obs = {}                       # 存储所有智能体的观测
-        all_infos = {}                     # 存储所有智能体的 info
+        # 1. Process 'RGB' observation
+        if 'RGB' in obs_dict:      # process RGB
+            obs_rgb = obs_dict['RGB'].astype(np.float32)
+            obs_rgb /= 255.0   
+            processed_obs['RGB'] = np.transpose(obs_rgb, (2, 0, 1))
         
-        global_info_payload = {}           # 全局信息载荷
+        # 2. Retain 'COLLECTIVE_REWARD' if present
+        if 'COLLECTIVE_REWARD' in obs_dict:
+            processed_obs['COLLECTIVE_REWARD'] = obs_dict['COLLECTIVE_REWARD']
+            
+        return processed_obs
+
+    def get_obs(self) -> Dict[str, np.ndarray]:
+        if self._last_timestep is None:
+            raise RuntimeError("Must call reset() before calling get_obs()")
+            
+        focal_obs_list = self._last_timestep.observation  # list of observations for all agents
         
-        # 1. 提取全局渲染观测
-        if mp_obs_list:                    # 确保观测列表非空
-            first_obs = mp_obs_list[0]     # 第一个智能体的观测
-            if self.global_render_key in first_obs:                        # 如果存在全局渲染键
-                global_render_frame = first_obs[self.global_render_key]    # 提取渲染帧
-                global_info_payload["global_obs"] = {                      # 存储全局观测
-                    self.global_render_key: global_render_frame
-                }
-                self.latest_global_rgb = global_render_frame               # 更新最新全局渲染帧
+        obs_dict = {}                                     # dictionary to hold processed observations
+        for i, agent_id in enumerate(self.agent_ids):     # iterate over focal agents
+            obs_dict[agent_id] = self._preprocess_obs(    # preprocess observation
+                focal_obs_list[i]
+            )
+        return obs_dict
 
-        # 2. 为每个智能体处理 obs 和 info
-        for i, agent_name in enumerate(self.possible_agents):              # 遍历所有智能体
-            agent_obs_full = mp_obs_list[i]                                # 智能体的完整观测
-            agent_obs_filtered = {}                                        # 过滤后的观测
-            agent_info = global_info_payload.copy()                        # 初始化 info，包含全局信息
-            
-            for key, value in agent_obs_full.items():                      # 遍历观测键值对
-                if key == self.global_render_key:                          # 全局渲染键已处理，跳过
-                    pass
-                elif key in self.PERMITTED_LOCAL_OBSERVATIONS:             # 允许的局部观测键
-                    agent_obs_filtered[key] = value                        # 保留在观测中
-                else:                                                      # 其他键，移至 info                            
-                    agent_info[key] = value                                # 添加到 info
-            
-            all_obs[agent_name] = agent_obs_filtered                       # 存储过滤后的观测
-            all_infos[agent_name] = agent_info                             # 存储 info
-            
-        return all_obs, all_infos                                          # 返回 obs 和 info
+    def get_state(self) -> np.ndarray:
+        """ Get global state (flattened concatenation of all 'RGB' observations of focal agents). """
+        obs_dict = self.get_obs()    # get observations dictionary
+        # Extract only the RGB parts to construct the global state
+        obs_list = [obs_dict[agent_id]['RGB'] for agent_id in self.agent_ids if 'RGB' in obs_dict[agent_id]]
+        if not obs_list:
+            return np.array([]) 
 
-    def _init_pygame(self):
-        """
-        该方法用于初始化 Pygame 窗口，以支持 `human` 渲染模式下的可视化显示。
+        obs_stack = np.stack(obs_list, axis=0)  # stack along new axis
+        state = obs_stack.flatten()             # flatten to 1D array
+        return state
 
-        主要步骤:
-        1. 检查是否已初始化 Pygame 窗口 (`self.screen`)。
-        2. 如果未安装 Pygame 或屏幕大小未知，禁用 `human` 渲染模式并打印警告信息。
-        3. 初始化 Pygame，设置窗口标题和屏幕大小。
-        4. 创建 Pygame 时钟对象，用于控制渲染帧率。
+    def reset(self) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+        """ Reset the environment and return initial observations and state. """
+        self._step_count = 0
+        self._last_timestep = self._env.reset()
+        return self.get_obs(), self.get_state()
 
-        用途:
-            该方法确保在 `human` 渲染模式下正确初始化 Pygame 窗口，以便实时显示环境的渲染画面。
-        """
-        if self.screen is None and self.render_mode == "human":               # 仅在 human 模式下初始化
-            if pygame is None: raise ImportError("Pygame 未安装。")            # 检查 Pygame 安装
-            if self.screen_size is None:                                      # 检查屏幕大小
-                print("警告: 屏幕大小未知。'human' 渲染已禁用。")
-                self.render_mode = None                                       # 禁用 human 模式
-                return
-            pygame.init()                                                     # 初始化 Pygame
-            pygame.display.set_caption(f"MeltingPot - {self.level_name}")     # 设置窗口标题
-            self.screen = pygame.display.set_mode(self.screen_size)           # 创建窗口
-            self.clock = pygame.time.Clock()                                  # 创建时钟对象
-
-    def render(self):
-        """
-        该方法实现了 PettingZoo 的 `render` 接口，用于渲染环境的当前状态。支持两种渲染模式：
-        1. `rgb_array` 模式：返回当前环境的渲染帧（以 NumPy 数组形式表示）。
-        2. `human` 模式：通过 Pygame 显示实时渲染画面。
-
-        主要步骤:
-        1. 检查渲染模式是否为 `None` 或当前没有全局渲染帧，若是则直接返回 `None`。
-        2. 如果渲染模式为 `rgb_array`，返回当前的全局渲染帧。
-        3. 如果渲染模式为 `human`：
-            - 初始化 Pygame 窗口（若尚未初始化）。
-            - 将当前渲染帧转换为 Pygame 表面并显示在窗口中。
-            - 处理 Pygame 事件（如窗口关闭事件）。
-            - 控制渲染帧率（默认为 60 FPS）。
-
-        用途:
-            该方法用于可视化环境的当前状态，便于调试和分析。
-        """
-        if self.render_mode is None or self.latest_global_rgb is None:    # 如果未设置渲染模式或无渲染帧，返回 None
-            return None
-            
-        if self.render_mode == "rgb_array":                               # 如果是 rgb_array 模式，返回渲染帧
-            return self.latest_global_rgb
-
-        if self.render_mode == "human":                                   # 如果是 human 模式，使用 Pygame 显示
-            self._init_pygame()
-            if self.screen is None: return None                           # 如果 Pygame 未初始化，返回 None
-
-            frame = np.transpose(self.latest_global_rgb, (1, 0, 2))       # 转置为 Pygame 格式
-            surface = pygame.surfarray.make_surface(frame)                # 创建 Pygame 表面
-            self.screen.blit(surface, (0, 0))                             # 绘制到屏幕
-            pygame.display.flip()                                         # 更新显示
-
-            for event in pygame.event.get():                              # 处理 Pygame 事件
-                if event.type == pygame.QUIT:                             # 如果窗口关闭事件
-                    print("Pygame 窗口已关闭。")
-                    self.close()                                          # 关闭环境
-            
-            self.clock.tick(60)                                           # 控制帧率为 60 FPS
-            return None
-
-    def reset(self, seed=None, options=None):
-        """
-        该方法实现了 PettingZoo 的 `reset` 接口，用于重置环境到初始状态。重置后，所有智能体的观测和附加信息会被返回。
-
-        主要步骤:
-        1. 重置环境内部的 MeltingPot 环境 (`self._mp_env`)。
-        2. 调用 `_process_obs_and_info` 方法，将 MeltingPot 返回的观测数据拆分为局部观测 (`obs`) 和附加信息 (`info`)。
-        3. 更新当前活跃的智能体列表 (`self.agents`)。
-        4. 如果设置了渲染模式，调用 `render` 方法进行初始渲染。
-        5. 返回包含所有智能体的观测和附加信息的字典。
-
-        返回值:
-            - `observations`：包含每个智能体的局部观测数据。
-            - `infos`：包含每个智能体的附加信息（如全局观测等）。
-
-        用途:
-            该方法用于在每个新实验或新回合开始时重置环境，确保所有状态和数据从初始状态开始。
-        """
-        self.agents = self.possible_agents[:]                                            # 重置活跃智能体列表
-        self._mp_timestep = self._mp_env.reset()                                         # 重置 MeltingPot 环境
-        observations, infos = self._process_obs_and_info(self._mp_timestep.observation)  # 处理观测和 info
-        self.render()                                                                    # 初始渲染
-        return observations, infos                                                       # 返回观测和 info
-
-    def step(self, actions: dict):
-        """
-        该方法实现了 PettingZoo 的 `step` 接口，用于执行环境中的一步操作。
-        根据输入的动作字典，更新环境状态并返回新的观测、奖励、终止标志、截断标志和附加信息。
-
-        主要步骤:
-        1. 将输入的动作字典转换为 MeltingPot 环境所需的动作列表。
-        2. 调用 MeltingPot 环境的 `step` 方法，执行一步操作。
-        3. 调用 `_process_obs_and_info` 方法，将 MeltingPot 返回的观测数据拆分为局部观测 (`obs`) 和附加信息 (`info`)。
-        4. 根据 MeltingPot 的 `step_type` 判断是否为最后一步，设置终止标志和截断标志。
-        5. 如果环境结束，清空当前活跃的智能体列表。
-        6. 如果设置了渲染模式，调用 `render` 方法进行渲染。
-        7. 返回包含观测、奖励、终止标志、截断标志和附加信息的字典。
-
-        返回值:
-            - `observations`：包含每个智能体的局部观测数据。
-            - `rewards`：包含每个智能体的奖励值。
-            - `terminations`：包含每个智能体的终止标志。
-            - `truncations`：包含每个智能体的截断标志。
-            - `infos`：包含每个智能体的附加信息。
-
-        用途:
-            该方法用于在环境中执行一步操作，更新状态并返回相关数据，便于强化学习算法进行训练。
-        """
-        mp_actions = [actions[agent] for agent in self.possible_agents]                   # 转换为动作列表
-        self._mp_timestep = self._mp_env.step(mp_actions)                                 # 执行一步操作
+    def step(self, actions_dict: Dict[str, int]) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
+        """ Take a step in the environment using the provided actions dictionary for focal agents. """
+        actions_list = [actions_dict[agent_id] for agent_id in self.agent_ids]  # convert dict to list for focal agents
+        self._last_timestep = self._env.step(actions_list)                      # take a step
+        self._step_count += 1
         
-        observations, infos = self._process_obs_and_info(self._mp_timestep.observation)   # 处理观测和 info
-        rewards = {                                                                       # 提取奖励
-            agent: self._mp_timestep.reward[i]
-            for i, agent in enumerate(self.possible_agents)
-        }
+        rewards_dict = {}           # dictionary for rewards
+        dones_dict = {}             # dictionary for done flags
+
+        focal_rewards_list = self._last_timestep.reward    # list of rewards for focal agents
         
-        is_done = self._mp_timestep.step_type == dm_env.StepType.LAST                      # 检查是否为最后一步
-        terminations = {agent: is_done for agent in self.possible_agents}                  # 终止标志
-        truncations = {agent: is_done for agent in self.possible_agents}                   # 截断标志
+        global_done = False
+        if self._step_count >= self.episode_limit:         # check episode limit
+            global_done = True
+        elif self._last_timestep.last():                   # check if episode ended
+            global_done = True
+
+        for i, agent_id in enumerate(self.agent_ids):       # iterate over focal agents
+            rewards_dict[agent_id] = focal_rewards_list[i]
+            dones_dict[agent_id] = global_done
+            
+        next_obs_dict = self.get_obs()                      # get next observations
+        next_state = self.get_state()                       # get next state
+        info_dict = {}                                      # empty info dictionary
         
-        if is_done: self.agents = []                                                       # 如果结束，清空活跃智能体列表
-        self.render()                                                                      # 渲染当前状态
-        return observations, rewards, terminations, truncations, infos                     # 返回结果
+        return next_obs_dict, next_state, rewards_dict, dones_dict, info_dict
+    
+    def render(self) -> np.ndarray:
+        """ Render the current environment state as an RGB array. """
+        if self._last_timestep is None:
+            raise RuntimeError("Must call reset() before calling render()")
+
+        # self._env._substrate.observation() 返回一个观测字典的列表
+        obs_list = self._env._substrate.observation()
+        if not obs_list:
+            raise ValueError("self._env._substrate.observation() returned an empty list.")
+
+        obs_dict = obs_list[0]           # we get WORLD.RGB from the first element (dict) of the list
+        if 'WORLD.RGB' not in obs_dict:
+            raise KeyError("Could not find 'WORLD.RGB' in self._env._substrate.observation()[0].")
+
+        return obs_dict['WORLD.RGB']
 
     def close(self):
-        """
-        方法名: close(self)
+        self._env.close()
 
-        功能描述:
-        该方法实现了 PettingZoo 的 `close` 接口，用于关闭环境并释放相关资源，包括 Pygame 窗口和 MeltingPot 环境。
+def build_meltingpot_env(env_name: str):
+    """
+    Constructs a Melting Pot environment (either Substrate or Scenario)
+    and returns a wrapper providing a unified API interface.
+    """
 
-        主要步骤:
-        1. 如果 Pygame 窗口已初始化，关闭窗口并退出 Pygame。
-        2. 调用 MeltingPot 环境的 `close` 方法，释放环境资源。
+    # Check if env_name is in the imported SUBSTRATES collection
+    if env_name in substrate_configs.SUBSTRATES:
+        return _SubstrateWrapper(substrate_name=env_name)
 
-        用途:
-            该方法用于在实验结束时清理资源，确保不会占用多余的系统内存或窗口资源。
-        """
-        if self.screen is not None:                          # 如果 Pygame 窗口已初始化
-            pygame.display.quit()                            # 关闭 Pygame 窗口
-            pygame.quit()                                    # 退出 Pygame
-            self.screen = None                               # 重置屏幕引用
-            print("Pygame 已关闭。")    
-        self._mp_env.close()                                 # 关闭 MeltingPot 环境
+    # Check if env_name is in the imported SCENARIO_CONFIGS dictionary
+    elif env_name in scenario_configs.SCENARIO_CONFIGS:
+        return _ScenarioWrapper(scenario_name=env_name)
 
-    def observation_space(self, agent):
-        """
-        获取指定智能体的观测空间。
-        """
-        return self.observation_spaces[agent]
+    # Otherwise, raise an error
+    else:
+        raise ValueError(
+            f"Unknown Melting Pot environment name: '{env_name}'.\n"
+            f"It is neither in meltingpot.configs.substrates.SUBSTRATES nor in meltingpot.configs.scenarios.SCENARIO_CONFIGS."
+        )
 
-    def action_space(self, agent):
-        """
-        获取指定智能体的动作空间。
-        """
-        return self.action_spaces[agent]
+def run_pygame_test(env, test_name: str, scale_factor: int = 10, fps: int = 10, steps: int = 100):
+    """
+    Run a brief test loop using Pygame.
+
+    Args:
+        env: An initialized _SubstrateWrapper or _ScenarioWrapper instance
+        test_name: Title for the display window ("Substrate" or "Scenario")
+        scale_factor: Factor to scale up the images (original (40, 72) is too small)
+        fps: Rendering frame rate
+        steps: Total number of steps to execute
+    """
+    
+    print(f"\n--- Launching Pygame test: {test_name} ---")
+    print(f"--- Running {steps} steps... (Press 'Q' or close the window to exit) ---")
+
+    pygame.init()
+
+    # Get the correct render shape (H, W, C) from env_info
+    render_shape = env.get_env_info()['render_shape']
+    H, W, C = render_shape
+
+    # Pygame uses (Width, Height)
+    screen_size = (W * scale_factor, H * scale_factor)
+    screen = pygame.display.set_mode(screen_size)
+    pygame.display.set_caption(f"Test: {test_name}")
+    clock = pygame.time.Clock()
+
+    # Reset the environment
+    obs_dict, state = env.reset()
+    
+    running = True
+    for i in range(steps):
+        if not running:
+            break
+
+        # 1. Handle quit events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_q:
+                    running = False
+
+        # 2. Get the render frame
+        frame = env.render() # (H, W, C)
+
+        # 3. Prepare Pygame Surface
+        # Pygame surface expects (W, H, C), so we swap H and W axes
+        frame_transposed = frame.swapaxes(0, 1) # (W, H, C)
+        surface = pygame.surfarray.make_surface(frame_transposed)
+
+        # 4. Scale and draw to the screen
+        scaled_surface = pygame.transform.scale(surface, screen_size)
+        screen.blit(scaled_surface, (0, 0))
+        pygame.display.flip()
+
+        # 5. Generate random actions
+        # Pygame test does not need to access obs or rewards, we only test rendering
+        actions_dict = {
+            agent_id: np.random.randint(0, env.n_actions) 
+            for agent_id in env.agent_ids
+        }
+
+        # 6. Execute one step
+        next_obs_dict, next_state, rewards_dict, dones_dict, _ = env.step(actions_dict)
+
+        # 7. Print collective reward (if available)
+        if 'COLLECTIVE_REWARD' in next_obs_dict[env.agent_ids[0]]:
+            coll_reward = next_obs_dict[env.agent_ids[0]]['COLLECTIVE_REWARD']
+            print(f"  [Step {i+1}/{steps}] {test_name} - Collective Reward: {coll_reward}", end="\r")
+
+        # 8. Control frame rate
+        clock.tick(fps)
+        
+        if dones_dict[env.agent_ids[0]]:
+            print(f"\n  [Step {i+1}] Environment terminated, resetting...")
+            obs_dict, state = env.reset()
+
+    pygame.quit()
+    print(f"\n--- Pygame test: {test_name} completed ---")
 
 if __name__ == "__main__":
+
+    # --- Global Settings ---
+
+    # !!! Set to True to pop up the Pygame window for testing !!!
+    SHOW_RENDER_WITH_PYGAME = True
+
+    # (40, 72, 3) is the correct WORLD.RGB shape for collaborative_cooking
+    CORRECT_RENDER_SHAPE = (40, 72, 3)
+    PYGAME_SCALE = 10  # Scale 40x72 to 400x720
+    PYGAME_FPS = 10    # Simulate running speed
+    PYGAME_STEPS = 200 # Simulate running steps
+
+    # --- Test 1: Load Substrate (Control All Agents) ---
+    print("="*50)
+    print("Test 1: Load Substrate (collaborative_cooking__asymmetric)")
+    print("="*50)
     
-    def test_env(env: MeltingPotPettingZooParallelWrapper):
-        """用于测试封装器的辅助函数 (已更新为循环)"""
-        print("\n" + "="*50)
-        print(f"--- 正在测试模式: '{env.mode}' (Render: {env.render_mode}) ---")
-        print(f"--- 关卡: '{env.level_name}' ---")
-        print(f"--- 智能体: {env.possible_agents} ---")
-        print("="*50)
-        
-        try:
-            print("\n[调用 env.reset()]")
-            observations, infos = env.reset()
-            first_agent = env.possible_agents[0]
+    env_substrate = build_meltingpot_env("collaborative_cooking__asymmetric")
+    
+    info_sub = env_substrate.get_env_info()
+    print("Substrate environment info (get_env_info()):")
+    print(f"  - n_agents: {info_sub['n_agents']}")
+    print(f"  - agent_ids: {info_sub['agent_ids']}")
+    print(f"  - render_shape: {info_sub['render_shape']}")
 
-            print(f"  > reset() 成功。")
-            print("\n  --- 观测空间 (Agent 0) ---")
-            print(f"  {env.observation_space(first_agent)}")
-            print("\n  --- 实际观测 (Agent 0) ---")
-            print(f"  Obs keys: {list(observations[first_agent].keys())}")
-            print("\n  --- 实际 Info (Agent 0) ---")
-            print(f"  Info keys: {list(infos[first_agent].keys())}")
+    # Validate metadata
+    assert info_sub["n_agents"] == 2
+    assert info_sub["agent_ids"] == ["player_0", "player_1"]
+    assert info_sub["render_shape"] == CORRECT_RENDER_SHAPE 
 
-            # 自动检查
-            print("\n  --- 自动检查 ---")
-            info_keys = list(infos[first_agent].keys())
-            obs_keys = list(observations[first_agent].keys())
-
-            assert "global_obs" in info_keys, "全局观测 'global_obs' 不在 info 中"
-            assert "WORLD.RGB" not in obs_keys, "'WORLD.RGB' 不应在 obs 中"
-            print("  > [检查通过] 全局观测 (WORLD.RGB) 已成功移至 info['global_obs']")
-            
-            if "COLLECTIVE_REWARD" in infos[first_agent]:
-                assert "COLLECTIVE_REWARD" in info_keys, "团队奖励 'COLLECTIVE_REWARD' 不在 info 中"
-                assert "COLLECTIVE_REWARD" not in obs_keys, "团队奖励 'COLLECTIVE_REWARD' 不应在 obs 中"
-                print("  > [检查通过] 团队奖励 (COLLECTIVE_REWARD) 已成功移至 info")
-            
-            if "NUM_OTHERS_WHO_CLEANED_THIS_STEP" in infos[first_agent]:
-                 assert "NUM_OTHERS_WHO_CLEANED_THIS_STEP" in info_keys
-                 assert "NUM_OTHERS_WHO_CLEANED_THIS_STEP" not in obs_keys
-                 print("  > [检查通过] 特殊键 (NUM_OTHERS...) 已成功移至 info")
-            
-            print("\n[调用 env.step() 10 次 (用于 'human' 渲染测试)]")
-            for i in range(10):
-                actions = {
-                    agent: env.action_space(agent).sample() 
-                    for agent in env.possible_agents
-                }
-                obs_step, rew, term, trunc, info_step = env.step(actions)
-                if not env.agents:
-                    print(f"  > 环境在第 {i} 步结束。正在重置...")
-                    env.reset()
-
-            print("\n  > 10 步循环测试完成。")
-
-        except Exception as e:
-            print(f"\n*** 测试失败: {e} ***")
-            import traceback
-            traceback.print_exc()
-        finally:
-            env.close()
-            print("\n--- 环境已关闭 ---")
-            print("="*50)
-
-    # ------------------------------------
-    # 测试 1: 'clean_up' (自博弈)
-    # ------------------------------------
-    env_self_play = MeltingPotPettingZooParallelWrapper(
-        level_name="clean_up", 
-        mode="self_play",
-        render_mode="human"
-    )
-    test_env(env_self_play)
-
-    # ------------------------------------
-    # 测试 2: 'collaborative_cooking__asymmetric' (自博弈)
-    # ------------------------------------
-    print("\n" * 3)
-    try:
-        env_cooking = MeltingPotPettingZooParallelWrapper(
-            level_name="collaborative_cooking__asymmetric",
-            mode="self_play",
-            render_mode="human"
+    # Run Pygame test (if enabled)
+    if SHOW_RENDER_WITH_PYGAME:
+        run_pygame_test(
+            env_substrate, 
+            test_name="Substrate (All Agents)", 
+            scale_factor=PYGAME_SCALE, 
+            fps=PYGAME_FPS,
+            steps=PYGAME_STEPS
         )
-        test_env(env_cooking)
-    except Exception as e:
-        print(f"*** 'collaborative_cooking__asymmetric' 加载失败: {e} ***")
-        print("这可能是因为该场景名称不正确或依赖项缺失，但封装器代码本身是通用的。")
+    
+    # Run headless test (check API)
+    obs_dict, state = env_substrate.reset()
+    frame = env_substrate.render()
+    assert frame.shape == CORRECT_RENDER_SHAPE
+    actions_dict_sub = {
+        "player_0": np.random.randint(0, info_sub["n_actions"]),
+        "player_1": np.random.randint(0, info_sub["n_actions"])
+    }
+    next_obs_dict, _, rewards_sub, _, _ = env_substrate.step(actions_dict_sub)
+    assert "COLLECTIVE_REWARD" in next_obs_dict["player_0"]
+    
+    env_substrate.close()
+    print("\n✅ Substrate validation successful!")
 
-    # ------------------------------------
-    # 测试 3: 'clean_up_0' (混合博弈)
-    # ------------------------------------
-    print("\n" * 3)
-    try:
-        env_cooking = MeltingPotPettingZooParallelWrapper(
-            level_name="clean_up_0",
-            mode="mixed_control",
-            render_mode="human"
+
+    # --- Test 2: Load Scenario (Control Focal Agent Only) ---
+    print("\n" + "="*50)
+    print("Test 2: Load Scenario (collaborative_cooking__asymmetric_0)")
+    print("="*50)
+
+    env_scenario = build_meltingpot_env("collaborative_cooking__asymmetric_0")
+
+    info_scn = env_scenario.get_env_info()
+    print("Scenario environment info (get_env_info()):")
+    print(f"  - n_agents: {info_scn['n_agents']}")
+    print(f"  - agent_ids: {info_scn['agent_ids']}")
+    print(f"  - render_shape: {info_scn['render_shape']}")
+
+    # Validate metadata
+    assert info_scn["n_agents"] == 1
+    assert info_scn["agent_ids"] == ["player_0"]
+    assert info_scn["render_shape"] == CORRECT_RENDER_SHAPE # <-- 已修正
+
+    # Run Pygame test (if enabled)
+    if SHOW_RENDER_WITH_PYGAME:
+        run_pygame_test(
+            env_scenario, 
+            test_name="Scenario (Focal Agents + Bots)", 
+            scale_factor=PYGAME_SCALE, 
+            fps=PYGAME_FPS,
+            steps=PYGAME_STEPS
         )
-        test_env(env_cooking)
-    except Exception as e:
-        print(f"*** 'collaborative_cooking__asymmetric' 加载失败: {e} ***")
-        print("这可能是因为该场景名称不正确或依赖项缺失，但封装器代码本身是通用的。")
 
-        
+    # Run headless test (check API)
+    obs_dict, state = env_scenario.reset()
+    frame_scn = env_scenario.render()
+    assert frame_scn.shape == CORRECT_RENDER_SHAPE
+    actions_dict_scn = {
+        "player_0": np.random.randint(0, info_scn["n_actions"])
+    }
+    next_obs_dict_scn, _, rewards_scn, _, _ = env_scenario.step(actions_dict_scn)
+    assert "player_0" in rewards_scn
+    assert "player_1" not in rewards_scn
+    assert "COLLECTIVE_REWARD" in next_obs_dict_scn["player_0"]
+
+    env_scenario.close()
+    print("\n✅ Scenario validation successful!")
+    
+    print("\n" + "="*50)
+    print("🎉 Factory function (build_meltingpot_env) compatibility validation passed! 🎉")
+    print("="*50)
+
