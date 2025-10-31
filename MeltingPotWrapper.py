@@ -87,8 +87,8 @@ class _SubstrateWrapper:
             obs_rgb /= 255.0                              
             processed_obs['RGB'] = np.transpose(obs_rgb, (2, 0, 1))   
         
-        if 'COLLECTIVE_REWARD' in obs_dict:  # retain collective reward if exists
-            processed_obs['COLLECTIVE_REWARD'] = obs_dict['COLLECTIVE_REWARD']
+        # if 'COLLECTIVE_REWARD' in obs_dict:  # retain collective reward if exists
+        #     processed_obs['COLLECTIVE_REWARD'] = obs_dict['COLLECTIVE_REWARD']
         
         return processed_obs
 
@@ -147,7 +147,12 @@ class _SubstrateWrapper:
             
         next_obs_dict = self.get_obs()                      # get next observations
         next_state = self.get_state()                       # get next state
-        info_dict = {}                                      # empty info dictionary
+        info_dict = {}                                    # empty info dictionary
+
+        if self._last_timestep.observation:                                             # if observations exist
+            raw_obs_agent_0 = self._last_timestep.observation[0]                        # raw obs of agent 0
+            if 'COLLECTIVE_REWARD' in raw_obs_agent_0:
+                info_dict['collective_reward'] = raw_obs_agent_0['COLLECTIVE_REWARD']    # add collective reward to info
         
         return next_obs_dict, next_state, rewards_dict, dones_dict, info_dict
 
@@ -258,9 +263,9 @@ class _ScenarioWrapper:
             obs_rgb /= 255.0   
             processed_obs['RGB'] = np.transpose(obs_rgb, (2, 0, 1))
         
-        # 2. Retain 'COLLECTIVE_REWARD' if present
-        if 'COLLECTIVE_REWARD' in obs_dict:
-            processed_obs['COLLECTIVE_REWARD'] = obs_dict['COLLECTIVE_REWARD']
+        # # 2. Retain 'COLLECTIVE_REWARD' if present
+        # if 'COLLECTIVE_REWARD' in obs_dict:
+        #     processed_obs['COLLECTIVE_REWARD'] = obs_dict['COLLECTIVE_REWARD']
             
         return processed_obs
 
@@ -319,6 +324,11 @@ class _ScenarioWrapper:
         next_obs_dict = self.get_obs()                      # get next observations
         next_state = self.get_state()                       # get next state
         info_dict = {}                                      # empty info dictionary
+
+        if self._last_timestep.observation:
+            raw_obs_agent_0 = self._last_timestep.observation[0]
+            if 'COLLECTIVE_REWARD' in raw_obs_agent_0:
+                info_dict['collective_reward'] = raw_obs_agent_0['COLLECTIVE_REWARD']
         
         return next_obs_dict, next_state, rewards_dict, dones_dict, info_dict
     
@@ -426,11 +436,11 @@ def run_pygame_test(env, test_name: str, scale_factor: int = 10, fps: int = 10, 
         }
 
         # 6. Execute one step
-        next_obs_dict, next_state, rewards_dict, dones_dict, _ = env.step(actions_dict)
+        next_obs_dict, next_state, rewards_dict, dones_dict, info = env.step(actions_dict)
 
         # 7. Print collective reward (if available)
         if 'COLLECTIVE_REWARD' in next_obs_dict[env.agent_ids[0]]:
-            coll_reward = next_obs_dict[env.agent_ids[0]]['COLLECTIVE_REWARD']
+            coll_reward = info['collective_reward']
             print(f"  [Step {i+1}/{steps}] {test_name} - Collective Reward: {coll_reward}", end="\r")
 
         # 8. Control frame rate
@@ -492,8 +502,9 @@ if __name__ == "__main__":
         "player_0": np.random.randint(0, info_sub["n_actions"]),
         "player_1": np.random.randint(0, info_sub["n_actions"])
     }
-    next_obs_dict, _, rewards_sub, _, _ = env_substrate.step(actions_dict_sub)
-    assert "COLLECTIVE_REWARD" in next_obs_dict["player_0"]
+    next_obs_dict, _, rewards_sub, _, info_sub_step = env_substrate.step(actions_dict_sub)
+    assert "COLLECTIVE_REWARD" not in next_obs_dict["player_0"]
+    assert "collective_reward" in info_sub_step
     
     env_substrate.close()
     print("\n✅ Substrate validation successful!")
@@ -534,10 +545,11 @@ if __name__ == "__main__":
     actions_dict_scn = {
         "player_0": np.random.randint(0, info_scn["n_actions"])
     }
-    next_obs_dict_scn, _, rewards_scn, _, _ = env_scenario.step(actions_dict_scn)
+    next_obs_dict_scn, _, rewards_scn, _, info_scn_step = env_scenario.step(actions_dict_scn)
     assert "player_0" in rewards_scn
     assert "player_1" not in rewards_scn
-    assert "COLLECTIVE_REWARD" in next_obs_dict_scn["player_0"]
+    assert "COLLECTIVE_REWARD" not in next_obs_dict_scn["player_0"]
+    assert "collective_reward" in info_scn_step
 
     env_scenario.close()
     print("\n✅ Scenario validation successful!")
