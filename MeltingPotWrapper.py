@@ -337,7 +337,7 @@ class _ScenarioWrapper:
         if self._last_timestep is None:
             raise RuntimeError("Must call reset() before calling render()")
 
-        # self._env._substrate.observation() 返回一个观测字典的列表
+        # self._env._substrate.observation() returns a list of observation dictionaries
         obs_list = self._env._substrate.observation()
         if not obs_list:
             raise ValueError("self._env._substrate.observation() returned an empty list.")
@@ -526,7 +526,7 @@ if __name__ == "__main__":
     # Validate metadata
     assert info_scn["n_agents"] == 1
     assert info_scn["agent_ids"] == ["player_0"]
-    assert info_scn["render_shape"] == CORRECT_RENDER_SHAPE # <-- 已修正
+    assert info_scn["render_shape"] == CORRECT_RENDER_SHAPE # <-- Fixed
 
     # Run Pygame test (if enabled)
     if SHOW_RENDER_WITH_PYGAME:
