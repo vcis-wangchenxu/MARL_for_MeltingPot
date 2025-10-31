@@ -327,7 +327,6 @@ if __name__ == "__main__":
     print(f"  - data['player_0']['next_obs'].shape: \t{data['player_0']['next_obs'].shape} (Expected: {(T, *env_info['obs_shape'])})")
     assert data['player_0']['next_obs'].shape == (T, *env_info['obs_shape'])
 
-    # [新增] 验证个体奖励的形状
     print(f"  - data['player_0']['rewards'].shape: \t{data['player_0']['rewards'].shape} (Expected: {(T,)})")
     assert data['player_0']['rewards'].shape == (T,)
     if 'player_1' in data:
