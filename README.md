@@ -59,3 +59,5 @@ Our currently implemented and verified algorithms and environments are as follow
 | :--- | :---: | :---: |
 | **QMIX** (Off-Policy) | ✔ | ✔ |
 | **MAPPO** (On-Policy) | ✔ | (Pending) |
+
+[![Star History Chart](https://api.star-history.com/svg?repos=vcis-wangchenxu/MARL_for_MeltingPot.git&type=date&legend=top-left)](https://www.star-history.com/#vcis-wangchenxu/MARL_for_MeltingPot.git&type=date&legend=top-left)
