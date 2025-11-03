@@ -22,7 +22,7 @@ All our algorithms are experimented on MeltingPot. Before starting, please ensur
     ```
 3. Silence Warnings (Optional but recommended) 
 
-    Due to interference between multiple dependencies, you may see numerous $absl$ warnings. To silence these, please use the files in the $Eli_Warnings$ folder to replace the target files in your environment.
+    Due to interference between multiple dependencies, you may see numerous $absl$ warnings. To silence these, please use the files in the $Eli\_Warnings$ folder to replace the target files in your environment.
 
 ## 🖥️ Hardware Requirements
 1. Devcontainer (x86 only)
