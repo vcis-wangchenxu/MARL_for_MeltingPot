@@ -55,9 +55,13 @@ python Eval_MeltingPot.py
 
 ## ✅ Supported Algorithms & Environments
 Our currently implemented and verified algorithms and environments are as follows:
-| Algorithm | `collaborative_cooking__asymmetric` | `clean_up` |
+<!-- | Algorithm | `collaborative_cooking__asymmetric` | `clean_up` |
 | :--- | :---: | :---: |
 | **QMIX** (Off-Policy) | ✔ | ✔ |
-| **MAPPO** (On-Policy) | ✔ | (Pending) |
+| **MAPPO** (On-Policy) | ✔ | (Pending) | -->
+| Algorithm | Training | Eval | Original Paper Address | Paper Env |
+| :--- | :---: | :---: |  :---: |  :---: | 
+| **QMIX** (Off-Policy) | 'collaborative_cooking__asymmetric' | 'collaborative_cooking__asymmetric' | [Address](https://arxiv.org/abs/1803.11485) | SMAC |
+| **VDN** (Off-Policy) | 'collaborative_cooking__asymmetric' | 'collaborative_cooking__asymmetric' | [Address](https://arxiv.org/abs/1706.05296) | Switch; Fetch; Checkers |
 
 [![Star History Chart](https://api.star-history.com/svg?repos=vcis-wangchenxu/MARL_for_MeltingPot.git&type=date&legend=top-left)](https://www.star-history.com/#vcis-wangchenxu/MARL_for_MeltingPot.git&type=date&legend=top-left)
