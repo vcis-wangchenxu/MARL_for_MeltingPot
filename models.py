@@ -213,7 +213,23 @@ class QMixer(nn.Module):
             q_total = q_total_flat.view(B)
             
         return q_total
+
+class VDNMixer(nn.Module):
+    """
+    A simple summation mixer for ablation studies.
+    Sums up individual agent Q-values to produce Q_tot."""
+    def __init__(self):
+        super(VDNMixer, self).__init__()
     
+    def forward(self,
+                agent_q_values: torch.Tensor) -> torch.Tensor:
+        """
+        Can handle two input shapes:
+        1. Sequence sampling: agent_q_values (B, L, N)
+        2. Single-step sampling/execution: agent_q_values (B, N)
+        """
+        q_total = torch.sum(agent_q_values, dim=-1)
+        return q_total
 
 if __name__ == "__main__":
     
