@@ -925,7 +925,7 @@ def get_config():
   # environment, but in order to train background bots it is sometimes useful
   # to give them a pseudoreward when they put items in the cooking pot. It has
   # the effect of shaping their behavior a bit in the right direction.
-  config.cooking_pot_pseudoreward = 0.0
+  config.cooking_pot_pseudoreward = 1.0 # 0.0
 
   # Action set configuration.
   config.action_set = ACTION_SET
