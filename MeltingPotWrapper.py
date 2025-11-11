@@ -1,6 +1,6 @@
 import logging
 import os
-os.environ['SDL_AUDIODRIVER'] = 'dummy'
+# os.environ['SDL_AUDIODRIVER'] = 'dummy'
 logging.getLogger('absl').setLevel(logging.ERROR)
 
 import numpy as np
@@ -32,8 +32,8 @@ class _SubstrateWrapper:
         self._config = substrate.get_config(self.substrate_name)  # substrate config
 
         # 2. Get player roles and agent IDs
-        self._roles = self._config.default_player_roles           # player roles
-        self.n_agents = len(self._roles)                          # number of agents
+        self._roles = self._config.default_player_roles                # player roles
+        self.n_agents = len(self._roles)                               # number of agents
         self.agent_ids = [f"player_{i}" for i in range(self.n_agents)] # agent IDs
 
         # 3. Get action space
@@ -60,18 +60,20 @@ class _SubstrateWrapper:
                 self._obs_spec.shape[0], 
                 self._obs_spec.shape[1]
             )
-            self._obs_size = np.prod(self.obs_shape)   # single agent obs size (C * H * W)
-            self.state_shape = self.n_agents * self._obs_size # global state size (n_agents * C * H * W)
+            self.state_shape = (self.n_agents,) + self.obs_shape # concat all agent's obs (N, C, H, W)
         else:
             print("[Wrapper] Warning: 'RGB' not found in substrate observation spec. 'obs_shape' and 'state_shape' will be None/0.")
             self._obs_spec = None
             self.obs_shape = None
-            self._obs_size = 0
-            self.state_shape = 0
-
-        # Render spec is still required for pygame test
-        self._render_spec = self._config.timestep_spec.observation["WORLD.RGB"]
-        self.render_shape = self._render_spec.shape      # (H, W, C)
+            self.state_shape = None
+        
+        if "WORLD.RGB" in self._config.timestep_spec.observation:
+            self._global_spec = self._config.timestep_spec.observation["WORLD.RGB"]
+            self.global_shape = self._global_spec.shape    # (H, W, C)
+        else:
+            print("[Wrapper] Warning: 'WORLD.RGB' not found in substrate observation spec. 'global_shape' will be None/0.")
+            self._global_spec = None    # self._render_spec
+            self.global_shape = None    # self.render_shape
 
         self._last_timestep = None
         print(f"[Wrapper] Substrate initialization complete. N_Agents = {self.n_agents}")
@@ -82,16 +84,16 @@ class _SubstrateWrapper:
             "n_actions": self.n_actions,            # number of actions
             "agent_ids": self.agent_ids,            # agent IDs
             "obs_shape": self.obs_shape,            # observation shape (C, H, W) or None
-            "state_shape": self.state_shape,        # state shape (N * C * H * W) or 0
-            "render_shape": self.render_shape,      # render shape (H, W, C)
-            "episode_limit": self.episode_limit     # episode limit
+            "state_shape": self.state_shape,        # state shape (N, C, H, W) or 0
+            "global_shape": self.global_shape,      # render shape (H, W, C)
+            "episode_limit": self.episode_limit,    # episode limit
         }
         return info
 
     # --- General purpose observation preprocessing ---
     def _preprocess_obs(self, obs_dict: dict) -> dict:
         """ Preprocess observation dictionary:
-            - Convert 'RGB' to (C, H, W) and normalize
+            - Convert 'RGB' and 'WORLD.RGB' to (C, H, W) and normalize
             - Pass through all other observation keys unmodified
         """
         processed_obs = {}
@@ -99,7 +101,7 @@ class _SubstrateWrapper:
             if key == 'RGB':
                 obs_rgb = value.astype(np.float32)
                 obs_rgb /= 255.0
-                processed_obs['RGB'] = np.transpose(obs_rgb, (2, 0, 1)) # (C, H, W)
+                processed_obs[key] = np.transpose(obs_rgb, (2, 0, 1)) # (C, H, W)
             else:
                 # Pass through other keys like "READY_TO_SHOOT", "INVENTORY",
                 # "NUM_OTHERS_WHO_CLEANED_THIS_STEP", "COLLECTIVE_REWARD", etc.
@@ -122,22 +124,34 @@ class _SubstrateWrapper:
         return obs_dict                                            # return the observation dictionary
 
     def get_state(self) -> np.ndarray:
-        """ Get global state (flattened concatenation of all 'RGB' observations). """
+        """ Get global state (stacked 'RGB' observations). """
         obs_dict = self.get_obs()   # get observations dictionary
         # Extract only the RGB parts to construct the global state
         obs_list = [obs_dict[agent_id]['RGB'] for agent_id in self.agent_ids if 'RGB' in obs_dict[agent_id]]
         if not obs_list:            # if obs_list is empty (e.g., no 'RGB' obs)
             return np.array([]) 
             
-        obs_stack = np.stack(obs_list, axis=0)    # stack along new axis
-        state = obs_stack.flatten()               # flatten to 1D array
-        return state                                                
+        state = np.stack(obs_list, axis=0)    # stack along new axis
+        return state  
 
-    def reset(self) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+    def get_global(self) -> np.ndarray:
+        """ Get global observation ('WORLD.RGB'). """
+        if self._last_timestep is None:
+            raise RuntimeError("Must call reset() before calling render()")
+        
+        agent_observations_list = self._last_timestep.observation
+        obs_dict = agent_observations_list[0]
+
+        if 'WORLD.RGB' in obs_dict:
+            return obs_dict['WORLD.RGB']
+        else:
+            raise KeyError("Could not find 'WORLD.RGB' in substrate observation[0].")                                   
+
+    def reset(self) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
         """ Reset the environment and return initial observations and state. """
         self._step_count = 0
         self._last_timestep = self._env.reset()
-        return self.get_obs(), self.get_state()
+        return self.get_obs(), {"concat_state": self.get_state(), "global_state": self.get_global()} # return obs and state dict
 
     def step(self, actions_dict: Dict[str, int]) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
         """ Take a step in the environment using the provided actions dictionary. """
@@ -162,28 +176,21 @@ class _SubstrateWrapper:
             
         next_obs_dict = self.get_obs()                       # get next observations
         next_state = self.get_state()                        # get next state
+        global_state = self.get_global()                     # get global observation
         info_dict = {}                                       # empty info dictionary
 
         if self._last_timestep.observation:                                          # if observations exist
             raw_obs_agent_0 = self._last_timestep.observation[0]                     # raw obs of agent 0
             if 'COLLECTIVE_REWARD' in raw_obs_agent_0:
                 info_dict['collective_reward'] = raw_obs_agent_0['COLLECTIVE_REWARD'] # add collective reward to info
+            if 'WORLD.RGB' in raw_obs_agent_0:
+                info_dict['global_state'] = global_state              # add global RGB to info
         
         return next_obs_dict, next_state, rewards_dict, dones_dict, info_dict
 
     def render(self) -> np.ndarray:
         """ Render the current environment state as an RGB array. """
-        if self._last_timestep is None:
-            raise RuntimeError("Must call reset() before calling render()")
-        obs_list = self._env.observation()
-        if not obs_list:
-            raise ValueError("self._env.observation() returned an empty list.")
-        obs_dict = obs_list[0]          # we get WORLD.RGB from the first element (dict) of the list
-
-        if 'WORLD.RGB' not in obs_dict:
-            raise KeyError("Could not find 'WORLD.RGB' in self._env.observation()[0].")
-
-        return obs_dict['WORLD.RGB']
+        return self.get_global()  # Ensure last timestep is available
     
     def close(self):
         self._env.close()
@@ -234,8 +241,7 @@ class _ScenarioWrapper:
                 obs_spec_rgb.shape[0], 
                 obs_spec_rgb.shape[1]
             )
-            self._obs_size = np.prod(self.obs_shape)   # single focal agent obs size (C * H * W)
-            self.state_shape = self.n_agents * self._obs_size # global state size (n_focal_agents * C * H * W)
+            self.state_shape = (self.n_agents,) + self.obs_shape  # concatenate state size (N, C, H, W)
         else:
             print("[Wrapper] Warning: 'RGB' not found in scenario observation spec. 'obs_shape' and 'state_shape' will be None/0.")
             self.obs_shape = None
@@ -252,8 +258,13 @@ class _ScenarioWrapper:
         self.episode_limit = lab2d_settings.get("maxEpisodeLengthFrames", 1000)
         self._step_count = 0
 
-        self._render_spec = self._substrate_config.timestep_spec.observation["WORLD.RGB"]
-        self.render_shape = self._render_spec.shape        # (H, W, C)
+        if "WORLD.RGB" in self._substrate_config.timestep_spec.observation:
+            self._global_spec = self._substrate_config.timestep_spec.observation["WORLD.RGB"]
+            self.global_shape = self._global_spec.shape    # (H, W, C)
+        else:
+            print("[Wrapper] Warning: 'WORLD.RGB' not found in substrate observation spec. 'global_shape' will be None/0.")
+            self._global_spec = None    # self._render_spec
+            self.global_shape = None    # self.render_shape
 
         self._last_timestep = None
         print(f"[Wrapper] Scenario initialization finished. N_Agents = {self.n_agents} (focal agents only)")
@@ -265,7 +276,7 @@ class _ScenarioWrapper:
             "agent_ids": self.agent_ids,            # agent IDs
             "obs_shape": self.obs_shape,            # observation shape (C, H, W) or None
             "state_shape": self.state_shape,        # state shape (N * C * H * W) or 0
-            "render_shape": self.render_shape,      # render shape
+            "global_shape": self.global_shape,      # global state shape
             "episode_limit": self.episode_limit     # episode limit
         }
         return info
@@ -282,7 +293,7 @@ class _ScenarioWrapper:
             if key == 'RGB':
                 obs_rgb = value.astype(np.float32)
                 obs_rgb /= 255.0
-                processed_obs['RGB'] = np.transpose(obs_rgb, (2, 0, 1)) # (C, H, W)
+                processed_obs[key] = np.transpose(obs_rgb, (2, 0, 1)) # (C, H, W)
             else:
                 # Pass through other keys
                 processed_obs[key] = value
@@ -303,16 +314,31 @@ class _ScenarioWrapper:
         return obs_dict
 
     def get_state(self) -> np.ndarray:
-        """ Get global state (flattened concatenation of all 'RGB' observations of focal agents). """
+        """ Get concat state (concatenation of all 'RGB' observations of focal agents). """
         obs_dict = self.get_obs()    # get observations dictionary
         # Extract only the RGB parts to construct the global state
         obs_list = [obs_dict[agent_id]['RGB'] for agent_id in self.agent_ids if 'RGB' in obs_dict[agent_id]]
         if not obs_list:
             return np.array([]) 
 
-        obs_stack = np.stack(obs_list, axis=0)  # stack along new axis
-        state = obs_stack.flatten()             # flatten to 1D array
+        state = np.stack(obs_list, axis=0)  # stack along new axis
         return state
+    
+    def get_global(self) -> np.ndarray:
+        """ Get global observation ('WORLD.RGB'). """
+        if self._last_timestep is None:
+            raise RuntimeError("Must call reset() before calling render()")
+        
+        substrate_obs_list = self._env._substrate.observation()  # full substrate observations
+        if not substrate_obs_list:
+            raise ValueError("self._env._substrate.observation() returned an empty list.")
+        
+        obs_dict = substrate_obs_list[0]  # observation of agent 0
+        if 'WORLD.RGB' in obs_dict:
+            return obs_dict['WORLD.RGB']
+        else:
+            # This should ideally not be reached if the substrate is configured correctly
+            raise KeyError("Could not find 'WORLD.RGB' in self._env._substrate.observation()[0].")
 
     def reset(self) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
         """ Reset the environment and return initial observations and state. """
@@ -343,6 +369,7 @@ class _ScenarioWrapper:
             
         next_obs_dict = self.get_obs()                   # get next observations
         next_state = self.get_state()                    # get next state
+        global_state = self.get_global()                     # get global observation
         info_dict = {}                                   # empty info dictionary
 
         if self._last_timestep.observation:
@@ -354,19 +381,7 @@ class _ScenarioWrapper:
     
     def render(self) -> np.ndarray:
         """ Render the current environment state as an RGB array. """
-        if self._last_timestep is None:
-            raise RuntimeError("Must call reset() before calling render()")
-
-        # self._env._substrate.observation() returns a list of observation dictionaries
-        obs_list = self._env._substrate.observation()
-        if not obs_list:
-            raise ValueError("self._env._substrate.observation() returned an empty list.")
-
-        obs_dict = obs_list[0]          # we get WORLD.RGB from the first element (dict) of the list
-        if 'WORLD.RGB' not in obs_dict:
-            raise KeyError("Could not find 'WORLD.RGB' in self._env._substrate.observation()[0].")
-
-        return obs_dict['WORLD.RGB']
+        return self.get_global()  # Ensure last timestep is available
 
     def close(self):
         self._env.close()
@@ -410,7 +425,7 @@ def run_pygame_test(env, test_name: str, scale_factor: int = 10, fps: int = 10, 
     pygame.init()
 
     # Get the correct render shape (H, W, C) from env_info
-    render_shape = env.get_env_info()['render_shape']
+    render_shape = env.get_env_info()['global_shape']
     H, W, C = render_shape
 
     # Pygame uses (Width, Height)
@@ -472,12 +487,13 @@ def run_pygame_test(env, test_name: str, scale_factor: int = 10, fps: int = 10, 
 
     pygame.quit()
     print(f"\n--- Pygame test: {test_name} completed ---")
+
 if __name__ == "__main__":
 
     # --- Global Settings ---
 
     # !!! Set to True to pop up the Pygame window for testing !!!
-    SHOW_RENDER_WITH_PYGAME = True
+    SHOW_RENDER_WITH_PYGAME = False
 
     # Shapes from config files
     CORRECT_RENDER_SHAPE_CLEANUP = (168, 240, 3) # From clean_up.py (H, W, C)
@@ -499,13 +515,13 @@ if __name__ == "__main__":
     print("Substrate environment info (get_env_info()):")
     print(f"  - n_agents: {info_sub['n_agents']}")
     print(f"  - agent_ids: {info_sub['agent_ids']}")
-    print(f"  - render_shape: {info_sub['render_shape']}")
+    print(f"  - global_shape: {info_sub['global_shape']}")
     print(f"  - obs_shape (C,H,W): {info_sub['obs_shape']}")
 
     # Validate metadata
     assert info_sub["n_agents"] == 7
     assert info_sub["agent_ids"] == [f"player_{i}" for i in range(7)]
-    assert info_sub["render_shape"] == CORRECT_RENDER_SHAPE_CLEANUP 
+    assert info_sub["global_shape"] == CORRECT_RENDER_SHAPE_CLEANUP 
 
     # Run Pygame test (if enabled)
     if SHOW_RENDER_WITH_PYGAME:
@@ -541,7 +557,6 @@ if __name__ == "__main__":
     assert "RGB" in next_obs_dict["player_0"]
     assert "READY_TO_SHOOT" in next_obs_dict["player_0"]
     assert "NUM_OTHERS_WHO_CLEANED_THIS_STEP" in next_obs_dict["player_0"]
-    # Note: clean_up does not provide "COLLECTIVE_REWARD" in obs or info
     
     env_substrate.close()
     print("\n✅ Substrate validation successful!")
@@ -558,13 +573,13 @@ if __name__ == "__main__":
     print("Scenario environment info (get_env_info()):")
     print(f"  - n_agents: {info_scn['n_agents']}")
     print(f"  - agent_ids: {info_scn['agent_ids']}")
-    print(f"  - render_shape: {info_scn['render_shape']}")
+    print(f"  - global_shape: {info_scn['global_shape']}")
     print(f"  - obs_shape (C,H,W): {info_scn['obs_shape']}")
 
     # Validate metadata
     assert info_scn["n_agents"] == 1
     assert info_scn["agent_ids"] == ["player_0"]
-    assert info_scn["render_shape"] == CORRECT_RENDER_SHAPE_COOKING
+    assert info_scn["global_shape"] == CORRECT_RENDER_SHAPE_COOKING
 
     # Run Pygame test (if enabled)
     if SHOW_RENDER_WITH_PYGAME:
