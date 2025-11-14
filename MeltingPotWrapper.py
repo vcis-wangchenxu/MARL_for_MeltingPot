@@ -70,30 +70,24 @@ class _SubstrateWrapper:
     def __init__(self, substrate_name: str):
         print(f"[Wrapper] Initializing Substrate: {substrate_name}...")
 
-        # 1. Load substrate config
         self.substrate_name = substrate_name                      # substrate name
         self._config = substrate.get_config(self.substrate_name)  # substrate config
 
-        # 2. Get player roles and agent IDs
         self._roles = self._config.default_player_roles                # player roles
         self.n_agents = len(self._roles)                               # number of agents
         self.agent_ids = [f"player_{i}" for i in range(self.n_agents)] # agent IDs
 
-        # 3. Get action space
         self._action_set = self._config.action_set                # action set
         self.n_actions = len(self._action_set)                    # number of actions (discrete)
 
-        # 4. Build the underlying Melting Pot environment
         self._env = substrate.build_from_config(self._config, roles=self._roles)
 
-        # 5. Get episode length limit
         lab2d_settings = self._config.lab2d_settings_builder(     # get lab2d settings
             roles=self._roles, config=self._config
         )
         self.episode_limit = lab2d_settings.get("maxEpisodeLengthFrames", 1000) # episode limit
         self._step_count = 0
 
-        # 6. Get observation space (RGB, Vector, and Global) from spec
         agent_spec = self._config.timestep_spec.observation
         
         # --- Vector observation spec (processing) ---
@@ -105,20 +99,15 @@ class _SubstrateWrapper:
             if key in VECTOR_OBS_EXCLUDE_KEYS:
                 continue
             
-            # Check if it's a discrete scalar (e.g., DiscreteArray(shape=(), num_values=2))
             if isinstance(spec, specs.DiscreteArray) and spec.shape == ():
                 self._discrete_scalar_map[key] = spec.num_values
                 self.obs_vector_dim += spec.num_values
                 self.vector_keys.append(key)
             
-            # Check if it's any other array (continuous vector, bounded array, etc.)
             elif hasattr(spec, 'shape') and hasattr(spec, 'dtype'): 
-                # This is a general check for Array-like specs (e.g., shape=(3,))
                 self.obs_vector_dim += np.prod(spec.shape) # spec.size is total elements
                 self.vector_keys.append(key)
             
-            # else: key is some complex/unsupported spec, skip it
-        
         self.vector_keys.sort()
         print(f"[Wrapper] Detected vector observation (Vector Obs) dimension: {self.obs_vector_dim}")
         print(f"[Wrapper] Contained discrete (one-hot) keys: {self._discrete_scalar_map}")
@@ -151,9 +140,6 @@ class _SubstrateWrapper:
             self._global_spec = None
             self.global_shape = None
 
-        # 7. Reset environment properly for the first step
-        self._last_timestep = self._env.reset()
-
         print(f"[Wrapper] Substrate initialization complete. N_Agents = {self.n_agents}")
 
     def get_env_info(self) -> dict:
@@ -166,6 +152,8 @@ class _SubstrateWrapper:
             "state_shape": self.state_shape,        # state shape (N, C, H, W) or 0
             "global_shape": self.global_shape,      # render shape (H, W, C)
             "episode_limit": self.episode_limit,    # episode limit
+            "vector_keys": self.vector_keys,        # vector observation keys
+            "discrete_scalar_map": self._discrete_scalar_map   # discrete scalar mapping
         }
         return info
 
@@ -221,14 +209,13 @@ class _SubstrateWrapper:
             if 'RGB' in agent_obs:
                 rgb_list.append(agent_obs['RGB'])
             
-            # --- MODIFIED CALL ---
             vector_obs = _extract_vector_obs(
                 agent_obs, self.vector_keys, self._discrete_scalar_map
             )
             vector_list.append(vector_obs)
 
-        stacked_rgb = np.stack(rgb_list, axis=0) if rgb_list else np.array([], dtype=np.float32)
-        stacked_vector = np.stack(vector_list, axis=0) if vector_list else np.array([], dtype=np.float32)
+        stacked_rgb = np.stack(rgb_list, axis=0) if rgb_list else np.array([], dtype=np.float32)           # (N, C, H, W)
+        stacked_vector = np.stack(vector_list, axis=0) if vector_list else np.array([], dtype=np.float32)  # (N, V)
 
         return {"rgb": stacked_rgb, "vector": stacked_vector}
         
@@ -316,14 +303,9 @@ class _ScenarioWrapper:
     def __init__(self, scenario_name: str):
         print(f"[Wrapper] Initializing Scenario: {scenario_name}...")
         self.scenario_name = scenario_name
-
-        # 1. Load scenario config (needed to get is_focal etc.)
         self._config = scenario.get_config(self.scenario_name)
-
-        # 2. Build the underlying Melting Pot *scenario* environment
         self._env = scenario.build(self.scenario_name)
 
-        # 3. Identify *focal* agents
         self._roles = self._config.roles                   # player roles
         self._is_focal = self._config.is_focal             # focal agent flags
         
@@ -336,13 +318,11 @@ class _ScenarioWrapper:
                 
         self.n_agents = len(self.agent_ids)                # number of focal agents
 
-        # 4. Get action and observation spaces (only for focal agents)
         self._action_spec_list = self._env.action_spec()   # list of action specs
         self._obs_spec_list = self._env.observation_spec() # list of observation specs
         
         self.n_actions = self._action_spec_list[0].num_values # assume all focal agents have same action space
 
-        # 5. Get episode length limit
         self._substrate_config = substrate.get_config(self._config.substrate) # substrate config
         self._substrate_roles = self._substrate_config.default_player_roles   # substrate roles
         
@@ -408,8 +388,6 @@ class _ScenarioWrapper:
             self._global_spec = None
             self.global_shape = None
 
-        self._last_timestep = self._env.reset()
-
         print(f"[Wrapper] Scenario initialization finished. N_Agents = {self.n_agents} (focal agents only)")
 
     def get_env_info(self) -> dict:
@@ -421,7 +399,9 @@ class _ScenarioWrapper:
             "obs_vector_dim": self.obs_vector_dim,  # vector observation dimension
             "state_shape": self.state_shape,        # state shape (Dict) or 0
             "global_shape": self.global_shape,      # render shape (H, W, C)
-            "episode_limit": self.episode_limit     # episode limit
+            "episode_limit": self.episode_limit,    # episode limit
+            "vector_keys": self.vector_keys,        # vector observation keys
+            "discrete_scalar_map": self._discrete_scalar_map   # discrete scalar mapping
         }
         return info
 
@@ -476,7 +456,6 @@ class _ScenarioWrapper:
             if 'RGB' in agent_obs:
                 rgb_list.append(agent_obs['RGB'])
             
-            # --- MODIFIED CALL ---
             vector_obs = _extract_vector_obs(
                 agent_obs, self.vector_keys, self._discrete_scalar_map
             )
@@ -792,7 +771,6 @@ if __name__ == "__main__":
     env_scenario.close()
     print("\n✅ Scenario validation successful!")
 
-
     # --- Test 3: API Consistency Check (Substrate vs Scenario) ---
     print("\n" + "="*50)
     print("Test 3: Verify API Consistency (Substrate vs Scenario)")
@@ -864,7 +842,6 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
 
-    
     print("\n" + "="*50)
     print("🎉 Factory function (build_meltingpot_env) compatibility validation passed! 🎉")
     print("="*50)
