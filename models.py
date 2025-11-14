@@ -4,215 +4,189 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Tuple
 
-class AgentDRQN(nn.Module):
+class AgentNetwork(nn.Module):
     """
-    Agent network for processing local observations (RGB images) and outputting Q-values.
-    Layout: CNN (features) → GRU (memory) → Linear (Q-values).
+    General Recurrent Agent Network - R-QMIX
+    - Porcessing RGB, Vector, or both combined
+    - Using GRUCell to manage hidden state for POMDP
     """
-    def __init__(self, obs_shape: Tuple[int, int, int], n_actions: int, rnn_hidden_dim: int = 64):
-        """
-        Parameters:
-        - obs_shape (Tuple): (C, H, W), e.g. (3, 40, 40)
-        - n_actions (int): Action space dimension, e.g. 8
-        - rnn_hidden_dim (int): GRU hidden layer size
-        """
-        super(AgentDRQN, self).__init__()
-        self.obs_shape = obs_shape
+    def __init__(self, rgb_shape: Tuple[int, int, int], vector_dim, n_actions: int, gru_hidden_dim: int = 64):
+        super(AgentNetwork, self).__init__()
         self.n_actions = n_actions
-        self.rnn_hidden_dim = rnn_hidden_dim
+        self.use_rgb = rgb_shape is not None and np.prod(rgb_shape) > 0
+        self.use_vector = vector_dim > 0
+        self.gru_hidden_dim = gru_hidden_dim
 
-        # Input: (B * L * N, C, H, W) = (B * L * N, 3, 40, 40)
-        self.conv = nn.Sequential(
-            nn.Conv2d(obs_shape[0], 32, kernel_size=8, stride=4), 
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten() 
-        )
+        cnn_out_dim = 0
+        vector_mlp_out_dim = 0
+
+        if self.use_rgb:
+            c, h, w,  = rgb_shape
+            self.cnn = nn.Sequential(
+                nn.Conv2d(c, 32, kernel_size=8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                nn.ReLU()
+            )
+            with torch.no_grad():
+                _dummy_input = torch.zeros(1, c, h, w)
+                cnn_out_dim = self.cnn(_dummy_input).flatten().shape[0]
+            print(f"[AgentNetwork] RGB (CNN) enabled. Output: {cnn_out_dim}")
         
-        # Dynamically computing the CNN output shape. 
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, *obs_shape)   # Create a dummy input of shape (1, C, H, W)
-            dummy_output = self.conv(dummy_input)      # Pass through CNN
-            self.cnn_out_dim = dummy_output.shape[1]   # .shape[1] capturing the feature dimension post-flattening
+        self.vector_dim = vector_dim
+        if self.use_vector:
+            self.vector_mlp = nn.Sequential(
+                nn.Linear(self.vector_dim, 128), 
+                nn.ReLU()
+            )
+            vector_mlp_out_dim = 128
+            print(f"[AgentNetwork] Vector (MLP) enabled. Output: {vector_mlp_out_dim}")
 
-        # 2. Recurrent layer (GRU)
-        # Input: (B * L * N, cnn_out_dim)
-        # GRU input needs (seq_len, batch, input_size) or (input_size) if batch_first=False
-        # We will handle the shape in forward
-        self.rnn = nn.GRUCell(self.cnn_out_dim, self.rnn_hidden_dim)
-
-        # 3. Output layer (Q-values)
-        # Input: (B * L * N, rnn_hidden_dim)
-        self.fc_q = nn.Linear(self.rnn_hidden_dim, self.n_actions)
-
-    def init_hidden(self, batch_size=1):
-        """Initialize hidden state to zero."""
-        return self.rnn.weight_ih.new(batch_size, self.rnn_hidden_dim).zero_() # input_to_hidden
-
-    def forward(self, 
-                obs_batch: torch.Tensor, 
-                hidden_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Can handle two input shapes:
-        1. Sequence sampling: obs_batch (B, L, N, C, H, W), hidden_state (B, N, hidden_dim)
-        2. Single-step sampling/execution: obs_batch (B, N, C, H, W), hidden_state (B, N, hidden_dim)
-
-        Returns:
-        - q_values (Tensor): (B, L, N, n_actions) or (B, N, n_actions)
-        - next_hidden_state (Tensor): (B, N, hidden_dim) (Note: GRU returns the last time step's hidden state)
-        """
-
-        is_sequence = (len(obs_batch.shape) == 6)
-
-        if is_sequence:
-            B, L, N, C, H, W = obs_batch.shape
-            # (B, L, N, C, H, W) -> (B * L * N, C, H, W)
-            obs_flat = obs_batch.reshape(-1, C, H, W)
-            # (B, N, hidden_dim) -> (B * N, hidden_dim) - Initial hidden state
-            # (Note: RNN only needs initial hidden state, subsequent steps are handled internally)
-            h_in = hidden_state.reshape(-1, self.rnn_hidden_dim) 
-        else: # Single-step
-            B, N, C, H, W = obs_batch.shape
-            L = 1 # Sequence length is 1
-            # (B, N, C, H, W) -> (B * N, C, H, W)
-            obs_flat = obs_batch.reshape(-1, C, H, W)
-            # (B, N, hidden_dim) -> (B * N, hidden_dim)
-            h_in = hidden_state.reshape(-1, self.rnn_hidden_dim)
-            
-        # (B * L * N, C, H, W) -> (B * L * N, cnn_out_dim)
-        cnn_features = self.conv(obs_flat)
-
-        # GRUCell needs input (batch, input_size) and hidden (batch, hidden_size)
-        # We need to loop over time steps
-        # (B * L * N, cnn_out_dim) -> (B, L, N, cnn_out_dim) -> (L, B, N, cnn_out_dim)
-        # -> (L, B * N, cnn_out_dim)
-        rnn_input = cnn_features.reshape(B, L, N, -1).permute(1, 0, 2, 3).reshape(L, B * N, -1)
+        gru_input_dim = cnn_out_dim + vector_mlp_out_dim
+        if gru_input_dim == 0:
+            raise ValueError("AgentNetwork has no inputs!")
         
-        gru_hiddens = []
-        h_current = h_in
-        for t in range(L):
-            h_current = self.rnn(rnn_input[t], h_current)   # (B * N, hidden_dim)
-            gru_hiddens.append(h_current)                   # Store hidden state at each time step
+        self.gru = nn.GRUCell(gru_input_dim, self.gru_hidden_dim)
+        print(f"[AgentNetwork] GRU enabled. Input: {gru_input_dim}, Hidden: {self.gru_hidden_dim}")
 
-        # (L, B * N, hidden_dim) -> (B * N * L, hidden_dim)
-        rnn_output_flat = torch.stack(gru_hiddens, dim=0).permute(1, 0, 2).reshape(B * L * N, -1)
+        self.mlp_out = nn.Linear(self.gru_hidden_dim, n_actions)
 
-        # GRUCell returns the last time step's hidden state
-        # (B * N, hidden_dim) -> (B, N, hidden_dim)
-        next_hidden_state = h_current.reshape(B, N, self.rnn_hidden_dim)
-
-        # 3. Compute Q values
-        # (B * L * N, hidden_dim) -> (B * L * N, n_actions)
-        q_values_flat = self.fc_q(rnn_output_flat)
-
-        # Restore shape
-        if is_sequence:
-            # (B * L * N, n_actions) -> (B, L, N, n_actions)
-            q_values = q_values_flat.reshape(B, L, N, self.n_actions)
-        else:
-            # (B * N, n_actions) -> (B, N, n_actions)
-            q_values = q_values_flat.reshape(B, N, self.n_actions)
-            
-        return q_values, next_hidden_state
+    def init_hidden(self, batch_size, device):
+        """ Return an all-zero initial hidden state """
+        return torch.zeros(batch_size, self.gru_hidden_dim).to(device)
     
-class QMixer(nn.Module):
-    """
-    Receives all agents' Q-values and the global state, then produces Q_tot.
-    """
-    def __init__(self, n_agents: int, state_shape: int, mixing_embed_dim: int = 32):
+    def forward(self, rgb_input, vector_input, h_in):
         """
+        Processes observations, updates the recurrent state, and computes Q-values.
+
         Args:
-        - n_agents (int): Number of agents
-        - state_shape (int): Dimension of global state (after flattening)
-        - mixing_embed_dim (int): Dimension of hidden layer in mixing network
-        """
-        super(QMixer, self).__init__()
-        self.n_agents = n_agents
-        self.state_shape = state_shape
-        self.mixing_embed_dim = mixing_embed_dim
-
-        # W1: state -> (n_agents * mixing_embed_dim)
-        self.hyper_w1 = nn.Sequential(
-            nn.Linear(self.state_shape, mixing_embed_dim * n_agents),
-            nn.ReLU()
-        )
-        # b1: state -> (mixing_embed_dim)
-        self.hyper_b1 = nn.Linear(self.state_shape, mixing_embed_dim)
-
-        # W2: state -> (mixing_embed_dim) -> Relu -> (mixing_embed_dim * 1)
-        self.hyper_w2 = nn.Sequential(
-            nn.Linear(self.state_shape, mixing_embed_dim),
-            nn.ReLU(),
-            nn.Linear(mixing_embed_dim, mixing_embed_dim * 1) 
-        )
-        # b2: state -> (1)
-        self.hyper_b2 = nn.Linear(self.state_shape, 1)
-
-    def forward(self, 
-                agent_q_values: torch.Tensor, 
-                states: torch.Tensor) -> torch.Tensor:
-        """
-        Can handle two input shapes:
-        1. Sequence sampling: agent_q_values (B, L, N), states (B, L, state_shape)
-        2. Single-step sampling/execution: agent_q_values (B, N), states (B, state_shape)
+            rgb_input (torch.Tensor): Batch of RGB observations. Shape: (B, C, H, W).
+            vector_input (torch.Tensor): Batch of vector observations. Shape: (B, vector_dim).
+            h_in (torch.Tensor): Previous hidden state. Shape: (B, gru_hidden_dim).
 
         Returns:
-        - q_total (Tensor): (B, L) or (B,)
+            q_values (torch.Tensor): Estimated Q-values for each action. Shape: (B, n_actions).
+            h_out (torch.Tensor): New hidden state. Shape: (B, gru_hidden_dim).
         """
+        b = h_in.size(0)
+        input_parts = []
 
-        is_sequence = (len(agent_q_values.shape) == 3)
+        if self.use_rgb:
+            cnn_out = self.cnn(rgb_input)
+            cnn_out_flat = cnn_out.view(b, -1)
+            input_parts.append(cnn_out_flat)
 
-        if is_sequence:
-            B, L, N = agent_q_values.shape
-            # (B, L, N) -> (B * L, N)
-            q_vals_flat = agent_q_values.reshape(-1, self.n_agents)
-            # (B, L, state_shape) -> (B * L, state_shape)
-            states_flat = states.reshape(-1, self.state_shape)
-        else: # Single-step
-            B, N = agent_q_values.shape
-            L = 1
-            # (B, N)
-            q_vals_flat = agent_q_values
-            # (B, state_shape)
-            states_flat = states
+        if self.use_vector:
+            vector_out = self.vector_mlp(vector_input)
+            input_parts.append(vector_out)
 
-        batch_size_effective = B * L # Effective batch size
+        x = torch.cat(input_parts, dim=1)
+        h_out = self.gru(x, h_in)
 
-        # (B * L, N) -> (B * L, 1, N)
-        q_vals_flat = q_vals_flat.view(batch_size_effective, 1, self.n_agents)
-
-        # Generate W1 and b1 (weights must be positive, use abs)
-        w1 = torch.abs(self.hyper_w1(states_flat))
-        # (B * L, N * embed_dim) -> (B * L, N, embed_dim)
-        w1 = w1.view(batch_size_effective, self.n_agents, self.mixing_embed_dim) 
-        # (B * L, embed_dim) -> (B * L, 1, embed_dim)
-        b1 = self.hyper_b1(states_flat).view(batch_size_effective, 1, self.mixing_embed_dim)
-
-        # (B*L, 1, N) @ (B*L, N, embed_dim) -> (B*L, 1, embed_dim)
-        hidden = F.elu(torch.bmm(q_vals_flat, w1) + b1)    # bmm: batch matrix multiplication -> (b, n, m) @ (b, m, p) = (b, n, p)
-
-        # Generate W2 and b2 (weights must be positive, use abs)
-        w2 = torch.abs(self.hyper_w2(states_flat))
-        # (B * L, embed_dim * 1) -> (B * L, embed_dim, 1)
-        w2 = w2.view(batch_size_effective, self.mixing_embed_dim, 1)
-        # (B * L, 1) -> (B * L, 1, 1)
-        b2 = self.hyper_b2(states_flat).view(batch_size_effective, 1, 1)
-
-        # (B * L, 1, embed_dim) @ (B * L, embed_dim, 1) -> (B * L, 1, 1)
-        q_total_flat = torch.bmm(hidden, w2) + b2
+        q_values = self.mlp_out(h_out)
+        return q_values, h_out
+    
+class MixerNetwork(nn.Module):
+    """
+    Gereral Mixer Network for QMIX/R-QMIX
+    - Porcessing RGB, Vector, or both combined as global state
+    - Using hypernetworks to generate mixing weights and biases
+    - Produces joint Q-value Q_tot
+    """
+    def __init__(self, n_agents, state_shape_dict, embed_dim=64):
+        super(MixerNetwork, self).__init__()
+        self.n_agents = n_agents
+        self.embed_dim = embed_dim
         
-        # Restore shape
-        if is_sequence:
-            # (B*L, 1, 1) -> (B, L)
-            q_total = q_total_flat.view(B, L)
-        else:
-            # (B, 1, 1) -> (B,)
-            q_total = q_total_flat.view(B)
-            
-        return q_total
+        self.state_rgb_shape = state_shape_dict.get('rgb')       # (N, C, H, W)
+        self.state_vector_shape = state_shape_dict.get('vector') # (N, V)
+
+        self.use_rgb_state = self.state_rgb_shape is not None and np.prod(self.state_rgb_shape) > 0
+        self.use_vector_state = self.state_vector_shape is not None and np.prod(self.state_vector_shape) > 0
+
+        state_processor_out_dim = 0
+
+        if self.use_rgb_state:
+            n, c, h, w = self.state_rgb_shape
+            cnn_input_channels = n * c
+            self.state_cnn = nn.Sequential(
+                nn.Conv2d(cnn_input_channels, 32, kernel_size=8, stride=4), nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU()
+            )
+            with torch.no_grad():
+                _dummy_input = torch.zeros(1, cnn_input_channels, h, w)
+                cnn_out_dim = self.state_cnn(_dummy_input).flatten().shape[0]
+            self.state_rgb_mlp = nn.Sequential(nn.Linear(cnn_out_dim, 128), nn.ReLU())
+            state_processor_out_dim += 128
+            print(f"[MixerNetwork] State RGB (CNN) enabled. Input: {(n, c, h, w)}, Output: 128")
+
+        if self.use_vector_state:
+            n, v = self.state_vector_shape
+            vector_input_dim = n * v
+            self.state_vector_mlp = nn.Sequential(nn.Linear(vector_input_dim, 128), nn.ReLU())
+            state_processor_out_dim += 128
+            print(f"[MixerNetwork] State Vector (MLP) enabled. Input: {(n, v)}, Output: 128")
+
+        if state_processor_out_dim == 0:
+            raise ValueError("MixerNetwork has no state inputs!")
+        print(f"[MixerNetwork] Hypernetwork Input dim: {state_processor_out_dim}")
+
+        self.hyper_w1 = nn.Sequential(
+            nn.Linear(state_processor_out_dim, 256), nn.ReLU(),
+            nn.Linear(256, self.n_agents * self.embed_dim)
+        )
+        self.hyper_b1 = nn.Linear(state_processor_out_dim, self.embed_dim)
+        self.hyper_w2 = nn.Sequential(
+            nn.Linear(state_processor_out_dim, self.embed_dim), nn.ReLU(),
+            nn.Linear(self.embed_dim, self.embed_dim)
+        )
+        self.hyper_b2 = nn.Sequential(
+            nn.Linear(state_processor_out_dim, self.embed_dim), nn.ReLU(),
+            nn.Linear(self.embed_dim, 1)
+        )
+
+    def forward(self, q_values, state_rgb, state_vector):
+        """
+        Mix individual agent Q-values into a joint Q_total conditioned on the global state.
+
+        Args:
+            q_values (torch.Tensor): Shape (B, N_agents). Per-agent Q estimates to mix.
+            state_rgb (torch.Tensor | None): Shape (B, N, C, H, W). Global RGB state; required if RGB state processing is enabled.
+            state_vector (torch.Tensor | None): Shape (B, N, V). Global vector state; required if vector state processing is enabled.
+
+        Returns:
+            q_total (torch.Tensor): Shape (B, 1). Mixed joint Q-value satisfying monotonicity.
+            state_vec (torch.Tensor): Shape (B, state_processor_out_dim). Concatenated state embedding used by the hyper-networks.
+        """
+        b = q_values.size(0)
+        state_parts = []
+
+        if self.use_rgb_state:
+            if state_rgb is None: raise ValueError("Mixer expected State RGB")
+            n_channels = state_rgb.shape[1] * state_rgb.shape[2]
+            rgb_in = state_rgb.view(b, n_channels, state_rgb.shape[3], state_rgb.shape[4])
+            cnn_out = self.state_cnn(rgb_in)
+            rgb_vec = self.state_rgb_mlp(cnn_out.view(b, -1))
+            state_parts.append(rgb_vec)
+
+        if self.use_vector_state:
+            if state_vector is None: raise ValueError("Mixer expected State Vector")
+            vec_in = state_vector.view(b, -1)
+            vec_vec = self.state_vector_mlp(vec_in)
+            state_parts.append(vec_vec)
+
+        state_vec = torch.cat(state_parts, dim=1) 
+        w1 = torch.abs(self.hyper_w1(state_vec)).view(b, self.n_agents, self.embed_dim)
+        b1 = self.hyper_b1(state_vec).view(b, 1, self.embed_dim)
+        w2 = torch.abs(self.hyper_w2(state_vec)).view(b, self.embed_dim, 1)
+        b2 = self.hyper_b2(state_vec).view(b, 1, 1)
+        q_values = q_values.view(b, 1, self.n_agents)
+        hidden = F.elu(torch.bmm(q_values, w1) + b1)
+        q_total = torch.bmm(hidden, w2) + b2
+        q_total = q_total.view(b, 1)
+        return q_total, state_vec
 
 class VDNMixer(nn.Module):
     """
@@ -230,6 +204,120 @@ class VDNMixer(nn.Module):
         """
         q_total = torch.sum(agent_q_values, dim=-1)
         return q_total
+
+class ActorCriticDRQN(nn.Module):
+    """
+    Agent network that processes local observations (RGB images) and outputs
+    both policy (actor) and state value (critic).
+    Layout: CNN (features) -> GRU (memory) -> Linear (Actor)
+                                            -> Linear (Critic)
+    """
+    def __init__(self, obs_shape: Tuple[int, int, int], n_actions: int, rnn_hidden_dim: int = 64):
+        """
+        Parameters:
+        - obs_shape (Tuple): (C, H, W), e.g. (3, 40, 40)
+        - n_actions (int): Action space dimension, e.g. 8
+        - rnn_hidden_dim (int): GRU hidden layer size
+        """
+        super(ActorCriticDRQN, self).__init__()
+        self.obs_shape = obs_shape
+        self.n_actions = n_actions
+        self.rnn_hidden_dim = rnn_hidden_dim
+
+        # 1. Convolutional layers (Same as AgentDRQN)
+        # Input: (B * L * N, C, H, W) = (B * L * N, 3, 40, 40)
+        self.conv = nn.Sequential(
+            nn.Conv2d(obs_shape[0], 32, kernel_size=8, stride=4), 
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten() 
+        )
+        
+        # Compute CNN output dimension
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, *obs_shape)
+            dummy_output = self.conv(dummy_input)
+            self.cnn_out_dim = dummy_output.shape[1]
+
+        # 2. Recurrent layer (GRU)
+        self.rnn = nn.GRUCell(self.cnn_out_dim, self.rnn_hidden_dim)
+
+        # 3. Output layers (Split into Actor and Critic)
+        self.fc_actor = nn.Linear(self.rnn_hidden_dim, self.n_actions) # Actor head
+        self.fc_critic = nn.Linear(self.rnn_hidden_dim, 1)             # Critic head
+
+    def init_hidden(self, batch_size=1):
+        """Initialize hidden state to zero."""
+        return self.rnn.weight_ih.new(batch_size, self.rnn_hidden_dim).zero_()
+
+    def forward(self, 
+                obs_batch: torch.Tensor, 
+                hidden_state: torch.Tensor,
+                dones_mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Handles three input shapes:
+        1. Sequence (training): obs_batch (B, L, N, C, H, W), hidden_state (B, N, hidden_dim)
+        2. Step (acting): obs_batch (B, N, C, H, W), hidden_state (B, N, hidden_dim)
+        3. Step with done mask (reset hidden state on done): obs_batch (B, N, C, H, W), hidden_state (B, N, hidden_dim), dones_mask (B, N)
+
+        Returns:
+        - actor_logits (Tensor): (B, L, N, n_actions) or (B, N, n_actions)
+        - state_values (Tensor): (B, L, N, 1) or (B, N, 1)
+        - next_hidden_state (Tensor): (B, N, hidden_dim)
+        """
+        is_sequence = (len(obs_batch.shape) == 6)
+
+        if is_sequence:
+            B, L, N, C, H, W = obs_batch.shape
+            obs_flat = obs_batch.reshape(-1, C, H, W)
+            h_in = hidden_state.reshape(-1, self.rnn_hidden_dim) 
+        else: # Single-step
+            B, N, C, H, W = obs_batch.shape
+            L = 1 
+            obs_flat = obs_batch.reshape(-1, C, H, W)
+            h_in = hidden_state.reshape(-1, self.rnn_hidden_dim)
+        
+        # (B, L, N, 1) -> (L, B * N, 1)
+        if dones_mask is None:
+            dones_mask = torch.zeros(B, L, N, 1, device=obs_batch.device, dtype=torch.float32)
+        # (B, L, N, 1) -> (L, B, N, 1) -> (L, B*N, 1)
+        dones_mask_expanded = dones_mask.permute(1, 0, 2, 3).reshape(L, B * N, 1)
+            
+        # (B * L * N, C, H, W) -> (B * L * N, cnn_out_dim)
+        cnn_features = self.conv(obs_flat)
+
+        # (B * L * N, cnn_out_dim) -> (L, B * N, cnn_out_dim)
+        rnn_input = cnn_features.reshape(B, L, N, -1).permute(1, 0, 2, 3).reshape(L, B * N, -1)
+        
+        gru_hiddens = []
+        h_current = h_in
+        for t in range(L):
+            h_current = h_current * (1.0 - dones_mask_expanded[t])  # Reset hidden state where done
+            h_current = self.rnn(rnn_input[t], h_current)
+            gru_hiddens.append(h_current)
+
+        # (L, B * N, hidden_dim) -> (B * L * N, hidden_dim)
+        rnn_output_flat = torch.stack(gru_hiddens, dim=0).permute(1, 0, 2).reshape(B * L * N, -1)
+        
+        # (B * N, hidden_dim) -> (B, N, hidden_dim)
+        next_hidden_state = h_current.reshape(B, N, self.rnn_hidden_dim)
+
+        # 3. Compute Actor Logits and Critic Values
+        actor_logits_flat = self.fc_actor(rnn_output_flat)
+        state_values_flat = self.fc_critic(rnn_output_flat)
+
+        # Restore shapes
+        if is_sequence:
+            actor_logits = actor_logits_flat.reshape(B, L, N, self.n_actions)
+            state_values = state_values_flat.reshape(B, L, N, 1)
+        else:
+            actor_logits = actor_logits_flat.reshape(B, N, self.n_actions)
+            state_values = state_values_flat.reshape(B, N, 1)
+            
+        return actor_logits, state_values, next_hidden_state
 
 if __name__ == "__main__":
     
@@ -249,28 +337,30 @@ if __name__ == "__main__":
         print(f"  - n_agents: {env_info['n_agents']}")
         print(f"  - n_actions: {env_info['n_actions']}")
         print(f"  - obs_shape (C,H,W): {env_info['obs_shape']}")
-        print(f"  - state_shape (flat): {env_info['state_shape']}")
+        print(f"  - state_shape (N,C,H,W): {env_info['state_shape']}")
     
     except ImportError:
         print("\n!!! Error: Unable to import build_meltingpot_env from MeltingPotWrapper.py.")
         print("!!! Please ensure MeltingPotWrapper.py is in the same directory or Python path.")
         env_info = {
             "n_agents": 2, "n_actions": 8,
-            "obs_shape": (3, 40, 40), "state_shape": 9600
+            "obs_shape": (3, 40, 40), 
+            "state_shape": (2, 3, 40, 40)
         }
         print("\nWarning: Using default dimensions to continue verification...")
     except Exception as e:
         print(f"\n!!! Error: Failed to load environment: {e}")
         env_info = {
             "n_agents": 2, "n_actions": 8,
-            "obs_shape": (3, 40, 40), "state_shape": 9600
+            "obs_shape": (3, 40, 40), 
+            "state_shape": (2, 3, 40, 40)
         }
         print("\nWarning: Using default dimensions to continue verification...")
 
     N_AGENTS = env_info['n_agents']
     N_ACTIONS = env_info['n_actions']
     OBS_SHAPE = env_info['obs_shape'] # (C, H, W)
-    STATE_SHAPE = env_info['state_shape'] # int
+    STATE_SHAPE = env_info['state_shape'] # (N, C, H, W)
     RNN_HIDDEN_DIM = 64
     MIXING_EMBED_DIM = 32
 
@@ -283,11 +373,11 @@ if __name__ == "__main__":
     L = 8 # Sequence Length
 
     dummy_obs_seq = torch.rand(B, L, N_AGENTS, *OBS_SHAPE)
-    dummy_state_seq = torch.rand(B, L, STATE_SHAPE)
+    dummy_state_seq = torch.rand(B, L, *STATE_SHAPE)
     dummy_hidden_init = agent_net.init_hidden(B * N_AGENTS).reshape(B, N_AGENTS, RNN_HIDDEN_DIM)
 
     dummy_obs_step = torch.rand(B, N_AGENTS, *OBS_SHAPE)
-    dummy_state_step = torch.rand(B, STATE_SHAPE)
+    dummy_state_step = torch.rand(B, *STATE_SHAPE)
     dummy_hidden_step = agent_net.init_hidden(B * N_AGENTS).reshape(B, N_AGENTS, RNN_HIDDEN_DIM)
 
     print("\nDummy input shapes:")
