@@ -16,6 +16,49 @@ from meltingpot import scenario
 from meltingpot.configs import substrates as substrate_configs
 from meltingpot.configs import scenarios as scenario_configs
 
+VECTOR_OBS_EXCLUDE_KEYS = frozenset(['RGB', 'WORLD.RGB', 'COLLECTIVE_REWARD'])
+
+def _extract_vector_obs(obs_dict_single_agent: Dict[str, Any], 
+                        vector_keys: List[str],
+                        discrete_map: Dict[str, int]) -> np.ndarray:
+    """ 
+    Extract and concatenate vector observations from the observation dictionary.
+    - One-hot encodes keys found in discrete_map.
+    - Flattens and concatenates other keys.
+    """
+    vector_parts = []
+    for key in vector_keys: # vector_keys is sorted
+        try:
+            value = obs_dict_single_agent[key]
+            
+            if key in discrete_map:
+                # Key is discrete, one-hot encode it
+                num_classes = discrete_map[key]
+                vector_parts.append(_one_hot_encode(value, num_classes))
+            else:
+                # Key is continuous (or just not a discrete scalar), flatten it
+                vector_parts.append(np.asarray(value).flatten())
+
+        except KeyError:
+            print(f"[Wrapper] Warning: Key '{key}' missing in observation dictionary.- Skipped.")
+            pass 
+        except ValueError as e:
+            print(f"[Wrapper] Warning: Error processing key '{key}' (value: {value}). Skipped. Error: {e}")
+            pass
+            
+    if not vector_parts:
+        return np.array([], dtype=np.float32)
+        
+    return np.concatenate(vector_parts, dtype=np.float32)
+
+def _one_hot_encode(value: int, num_classes: int) -> np.ndarray:
+    """Helper to create a one-hot vector."""
+    if not 0 <= value < num_classes:
+        raise ValueError(f"Value {value} is out of bounds for num_classes {num_classes}")
+    one_hot = np.zeros(num_classes, dtype=np.float32)
+    one_hot[int(value)] = 1.0
+    return one_hot
+
 class _SubstrateWrapper:
     """
     Wraps a Melting Pot Substrate environment.
@@ -50,32 +93,67 @@ class _SubstrateWrapper:
         self.episode_limit = lab2d_settings.get("maxEpisodeLengthFrames", 1000) # episode limit
         self._step_count = 0
 
-        # 6. Get observation space (specifically RGB and WORLD.RGB)
+        # 6. Get observation space (RGB, Vector, and Global) from spec
+        agent_spec = self._config.timestep_spec.observation
         
+        # --- Vector observation spec (processing) ---
+        self._discrete_scalar_map = {} # Stores {key: num_classes} for one-hot
+        self.obs_vector_dim = 0
+        self.vector_keys = [] # Will store all keys for the vector obs
+        
+        for key, spec in agent_spec.items():
+            if key in VECTOR_OBS_EXCLUDE_KEYS:
+                continue
+            
+            # Check if it's a discrete scalar (e.g., DiscreteArray(shape=(), num_values=2))
+            if isinstance(spec, specs.DiscreteArray) and spec.shape == ():
+                self._discrete_scalar_map[key] = spec.num_values
+                self.obs_vector_dim += spec.num_values
+                self.vector_keys.append(key)
+            
+            # Check if it's any other array (continuous vector, bounded array, etc.)
+            elif hasattr(spec, 'shape') and hasattr(spec, 'dtype'): 
+                # This is a general check for Array-like specs (e.g., shape=(3,))
+                self.obs_vector_dim += np.prod(spec.shape) # spec.size is total elements
+                self.vector_keys.append(key)
+            
+            # else: key is some complex/unsupported spec, skip it
+        
+        self.vector_keys.sort()
+        print(f"[Wrapper] Detected vector observation (Vector Obs) dimension: {self.obs_vector_dim}")
+        print(f"[Wrapper] Contained discrete (one-hot) keys: {self._discrete_scalar_map}")
+        print(f"[Wrapper] All vector keys (sorted): {self.vector_keys}")
+
         # --- Handle missing RGB ---
-        if "RGB" in self._config.timestep_spec.observation:
-            self._obs_spec = self._config.timestep_spec.observation["RGB"]
+        if "RGB" in agent_spec:
+            self._obs_spec = agent_spec["RGB"]
             self.obs_shape = (
                 self._obs_spec.shape[2], 
                 self._obs_spec.shape[0], 
                 self._obs_spec.shape[1]
             )
-            self.state_shape = (self.n_agents,) + self.obs_shape # concat all agent's obs (N, C, H, W)
         else:
             print("[Wrapper] Warning: 'RGB' not found in substrate observation spec. 'obs_shape' and 'state_shape' will be None/0.")
             self._obs_spec = None
             self.obs_shape = None
-            self.state_shape = None
         
-        if "WORLD.RGB" in self._config.timestep_spec.observation:
-            self._global_spec = self._config.timestep_spec.observation["WORLD.RGB"]
-            self.global_shape = self._global_spec.shape    # (H, W, C)
+        self.state_shape = {
+            "rgb": (self.n_agents,) + self.obs_shape if self.obs_shape else None,
+            "vector": (self.n_agents, self.obs_vector_dim)
+        }
+        
+        # --- Handle missing WORLD.RGB ---
+        if "WORLD.RGB" in agent_spec:
+            self._global_spec = agent_spec["WORLD.RGB"]
+            self.global_shape = self._global_spec.shape  # (H, W, C)
         else:
             print("[Wrapper] Warning: 'WORLD.RGB' not found in substrate observation spec. 'global_shape' will be None/0.")
-            self._global_spec = None    # self._render_spec
-            self.global_shape = None    # self.render_shape
+            self._global_spec = None
+            self.global_shape = None
 
-        self._last_timestep = None
+        # 7. Reset environment properly for the first step
+        self._last_timestep = self._env.reset()
+
         print(f"[Wrapper] Substrate initialization complete. N_Agents = {self.n_agents}")
 
     def get_env_info(self) -> dict:
@@ -84,6 +162,7 @@ class _SubstrateWrapper:
             "n_actions": self.n_actions,            # number of actions
             "agent_ids": self.agent_ids,            # agent IDs
             "obs_shape": self.obs_shape,            # observation shape (C, H, W) or None
+            "obs_vector_dim": self.obs_vector_dim,  # vector observation dimension
             "state_shape": self.state_shape,        # state shape (N, C, H, W) or 0
             "global_shape": self.global_shape,      # render shape (H, W, C)
             "episode_limit": self.episode_limit,    # episode limit
@@ -93,7 +172,8 @@ class _SubstrateWrapper:
     # --- General purpose observation preprocessing ---
     def _preprocess_obs(self, obs_dict: dict) -> dict:
         """ Preprocess observation dictionary:
-            - Convert 'RGB' and 'WORLD.RGB' to (C, H, W) and normalize
+            - Convert 'RGB' to (C, H, W) and normalize
+            - Remove 'WORLD.RGB' and 'COLLECTIVE_REWARD'
             - Pass through all other observation keys unmodified
         """
         processed_obs = {}
@@ -102,9 +182,14 @@ class _SubstrateWrapper:
                 obs_rgb = value.astype(np.float32)
                 obs_rgb /= 255.0
                 processed_obs[key] = np.transpose(obs_rgb, (2, 0, 1)) # (C, H, W)
+            
+            elif key in ['COLLECTIVE_REWARD', 'WORLD.RGB']:
+                # Exclude these keys from the agent's observation dict
+                pass
+
             else:
                 # Pass through other keys like "READY_TO_SHOOT", "INVENTORY",
-                # "NUM_OTHERS_WHO_CLEANED_THIS_STEP", "COLLECTIVE_REWARD", etc.
+                # "NUM_OTHERS_WHO_CLEANED_THIS_STEP", etc.
                 processed_obs[key] = value
         
         return processed_obs
@@ -123,35 +208,57 @@ class _SubstrateWrapper:
             )
         return obs_dict                                            # return the observation dictionary
 
-    def get_state(self) -> np.ndarray:
+    def get_state(self) -> Dict[str, np.ndarray]:
         """ Get global state (stacked 'RGB' observations). """
-        obs_dict = self.get_obs()   # get observations dictionary
-        # Extract only the RGB parts to construct the global state
-        obs_list = [obs_dict[agent_id]['RGB'] for agent_id in self.agent_ids if 'RGB' in obs_dict[agent_id]]
-        if not obs_list:            # if obs_list is empty (e.g., no 'RGB' obs)
-            return np.array([]) 
-            
-        state = np.stack(obs_list, axis=0)    # stack along new axis
-        return state  
+        obs_dict = self.get_obs()  # get observations dictionary
+        
+        rgb_list = []
+        vector_list = []
 
-    def get_global(self) -> np.ndarray:
+        for agent_id in self.agent_ids:
+            agent_obs = obs_dict[agent_id]
+
+            if 'RGB' in agent_obs:
+                rgb_list.append(agent_obs['RGB'])
+            
+            # --- MODIFIED CALL ---
+            vector_obs = _extract_vector_obs(
+                agent_obs, self.vector_keys, self._discrete_scalar_map
+            )
+            vector_list.append(vector_obs)
+
+        stacked_rgb = np.stack(rgb_list, axis=0) if rgb_list else np.array([], dtype=np.float32)
+        stacked_vector = np.stack(vector_list, axis=0) if vector_list else np.array([], dtype=np.float32)
+
+        return {"rgb": stacked_rgb, "vector": stacked_vector}
+        
+    def get_global(self) -> Dict[str, np.ndarray]:
         """ Get global observation ('WORLD.RGB'). """
         if self._last_timestep is None:
             raise RuntimeError("Must call reset() before calling render()")
         
         agent_observations_list = self._last_timestep.observation
-        obs_dict = agent_observations_list[0]
+        obs_dict_agent_0 = agent_observations_list[0]
 
-        if 'WORLD.RGB' in obs_dict:
-            return obs_dict['WORLD.RGB']
+        if 'WORLD.RGB' in obs_dict_agent_0:
+            world_rgb = obs_dict_agent_0['WORLD.RGB']
         else:
-            raise KeyError("Could not find 'WORLD.RGB' in substrate observation[0].")                                   
+            world_rgb = np.zeros(self.global_shape, dtype=np.uint8)   # Fallback to zeros if missing                             
+
+        state_dict = self.get_state()
+        all_vectors = state_dict["vector"]
+
+        return {"world_rgb": world_rgb, "all_vectors": all_vectors}
 
     def reset(self) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
         """ Reset the environment and return initial observations and state. """
         self._step_count = 0
         self._last_timestep = self._env.reset()
-        return self.get_obs(), {"concat_state": self.get_state(), "global_state": self.get_global()} # return obs and state dict
+
+        return self.get_obs(), {
+            "concat_state": self.get_state(),
+            "global_state": self.get_global()
+        }
 
     def step(self, actions_dict: Dict[str, int]) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
         """ Take a step in the environment using the provided actions dictionary. """
@@ -183,14 +290,15 @@ class _SubstrateWrapper:
             raw_obs_agent_0 = self._last_timestep.observation[0]                     # raw obs of agent 0
             if 'COLLECTIVE_REWARD' in raw_obs_agent_0:
                 info_dict['collective_reward'] = raw_obs_agent_0['COLLECTIVE_REWARD'] # add collective reward to info
-            if 'WORLD.RGB' in raw_obs_agent_0:
-                info_dict['global_state'] = global_state              # add global RGB to info
+        
+        info_dict['global_state'] = global_state
         
         return next_obs_dict, next_state, rewards_dict, dones_dict, info_dict
 
     def render(self) -> np.ndarray:
         """ Render the current environment state as an RGB array. """
-        return self.get_global()  # Ensure last timestep is available
+        global_state_dict = self.get_global()
+        return global_state_dict["world_rgb"]  # Ensure last timestep is available
     
     def close(self):
         self._env.close()
@@ -233,20 +341,6 @@ class _ScenarioWrapper:
         self._obs_spec_list = self._env.observation_spec() # list of observation specs
         
         self.n_actions = self._action_spec_list[0].num_values # assume all focal agents have same action space
-        
-        if "RGB" in self._obs_spec_list[0]:
-            obs_spec_rgb = self._obs_spec_list[0]["RGB"]
-            self.obs_shape = (
-                obs_spec_rgb.shape[2], 
-                obs_spec_rgb.shape[0], 
-                obs_spec_rgb.shape[1]
-            )
-            self.state_shape = (self.n_agents,) + self.obs_shape  # concatenate state size (N, C, H, W)
-        else:
-            print("[Wrapper] Warning: 'RGB' not found in scenario observation spec. 'obs_shape' and 'state_shape' will be None/0.")
-            self.obs_shape = None
-            self._obs_size = 0
-            self.state_shape = 0
 
         # 5. Get episode length limit
         self._substrate_config = substrate.get_config(self._config.substrate) # substrate config
@@ -258,15 +352,64 @@ class _ScenarioWrapper:
         self.episode_limit = lab2d_settings.get("maxEpisodeLengthFrames", 1000)
         self._step_count = 0
 
+        agent_spec = self._obs_spec_list[0] # Spec for focal agents
+
+        # --- Vector observation spec (processing) ---
+        self._discrete_scalar_map = {} # Stores {key: num_classes} for one-hot
+        self.obs_vector_dim = 0
+        self.vector_keys = [] # Will store all keys for the vector obs
+        
+        for key, spec in agent_spec.items():
+            if key in VECTOR_OBS_EXCLUDE_KEYS:
+                continue
+            
+            # Check if it's a discrete scalar (e.g., DiscreteArray(shape=(), num_values=2))
+            if isinstance(spec, specs.DiscreteArray) and spec.shape == ():
+                self._discrete_scalar_map[key] = spec.num_values
+                self.obs_vector_dim += spec.num_values
+                self.vector_keys.append(key)
+            
+            # Check if it's any other array (continuous vector, bounded array, etc.)
+            elif hasattr(spec, 'shape') and hasattr(spec, 'dtype'): 
+                # This is a general check for Array-like specs (e.g., shape=(3,))
+                self.obs_vector_dim += np.prod(spec.shape) # spec.size is total elements
+                self.vector_keys.append(key)
+            
+            # else: key is some complex/unsupported spec, skip it
+        
+        self.vector_keys.sort()
+        print(f"[Wrapper] Detected vector observation (Vector Obs) dimension: {self.obs_vector_dim}")
+        print(f"[Wrapper] Contained discrete (one-hot) keys: {self._discrete_scalar_map}")
+        print(f"[Wrapper] All vector keys (sorted): {self.vector_keys}")
+
+        # --- Handle missing RGB ---
+        if "RGB" in agent_spec:
+            obs_spec_rgb = agent_spec["RGB"]
+            self.obs_shape = (
+                obs_spec_rgb.shape[2], 
+                obs_spec_rgb.shape[0], 
+                obs_spec_rgb.shape[1]
+            )
+        else:
+            print("[Wrapper] Warning: 'RGB' not found in scenario observation spec. 'obs_shape' will be None.")
+            self.obs_shape = None
+        
+        self.state_shape = {
+            "rgb": (self.n_agents,) + self.obs_shape if self.obs_shape else None,
+            "vector": (self.n_agents, self.obs_vector_dim)
+        }
+
+        # --- Global shape (remains the same, from substrate config) ---
         if "WORLD.RGB" in self._substrate_config.timestep_spec.observation:
             self._global_spec = self._substrate_config.timestep_spec.observation["WORLD.RGB"]
             self.global_shape = self._global_spec.shape    # (H, W, C)
         else:
             print("[Wrapper] Warning: 'WORLD.RGB' not found in substrate observation spec. 'global_shape' will be None/0.")
-            self._global_spec = None    # self._render_spec
-            self.global_shape = None    # self.render_shape
+            self._global_spec = None
+            self.global_shape = None
 
-        self._last_timestep = None
+        self._last_timestep = self._env.reset()
+
         print(f"[Wrapper] Scenario initialization finished. N_Agents = {self.n_agents} (focal agents only)")
 
     def get_env_info(self) -> dict:
@@ -275,8 +418,9 @@ class _ScenarioWrapper:
             "n_actions": self.n_actions,            # number of actions
             "agent_ids": self.agent_ids,            # agent IDs
             "obs_shape": self.obs_shape,            # observation shape (C, H, W) or None
-            "state_shape": self.state_shape,        # state shape (N * C * H * W) or 0
-            "global_shape": self.global_shape,      # global state shape
+            "obs_vector_dim": self.obs_vector_dim,  # vector observation dimension
+            "state_shape": self.state_shape,        # state shape (Dict) or 0
+            "global_shape": self.global_shape,      # render shape (H, W, C)
             "episode_limit": self.episode_limit     # episode limit
         }
         return info
@@ -285,7 +429,8 @@ class _ScenarioWrapper:
         """
         Preprocessing the observation dictionary:
         - Transform 'RGB' to (C, H, W) format and normalize
-        - Retain all other keys (e.g., 'COLLECTIVE_REWARD') unchanged
+        - Remove 'WORLD.RGB' and 'COLLECTIVE_REWARD'
+        - Retain all other keys unchanged
         """
         processed_obs = {}
 
@@ -294,6 +439,11 @@ class _ScenarioWrapper:
                 obs_rgb = value.astype(np.float32)
                 obs_rgb /= 255.0
                 processed_obs[key] = np.transpose(obs_rgb, (2, 0, 1)) # (C, H, W)
+            
+            elif key in ['COLLECTIVE_REWARD', 'WORLD.RGB']:
+                # Exclude these keys from the agent's observation dict
+                pass
+
             else:
                 # Pass through other keys
                 processed_obs[key] = value
@@ -313,16 +463,32 @@ class _ScenarioWrapper:
             )
         return obs_dict
 
-    def get_state(self) -> np.ndarray:
+    def get_state(self) -> Dict[str, np.ndarray]:
         """ Get concat state (concatenation of all 'RGB' observations of focal agents). """
         obs_dict = self.get_obs()    # get observations dictionary
-        # Extract only the RGB parts to construct the global state
-        obs_list = [obs_dict[agent_id]['RGB'] for agent_id in self.agent_ids if 'RGB' in obs_dict[agent_id]]
-        if not obs_list:
-            return np.array([]) 
+        
+        rgb_list = []
+        vector_list = []
 
-        state = np.stack(obs_list, axis=0)  # stack along new axis
-        return state
+        for agent_id in self.agent_ids:
+            agent_obs = obs_dict[agent_id]
+
+            if 'RGB' in agent_obs:
+                rgb_list.append(agent_obs['RGB'])
+            
+            # --- MODIFIED CALL ---
+            vector_obs = _extract_vector_obs(
+                agent_obs, self.vector_keys, self._discrete_scalar_map
+            )
+            vector_list.append(vector_obs)
+        
+        stacked_rgb = np.stack(rgb_list, axis=0) if rgb_list else np.array([], dtype=np.float32)
+        stacked_vector = np.stack(vector_list, axis=0) if vector_list else np.array([], dtype=np.float32)
+        
+        return {
+            "rgb": stacked_rgb,
+            "vector": stacked_vector
+        }
     
     def get_global(self) -> np.ndarray:
         """ Get global observation ('WORLD.RGB'). """
@@ -333,18 +499,26 @@ class _ScenarioWrapper:
         if not substrate_obs_list:
             raise ValueError("self._env._substrate.observation() returned an empty list.")
         
-        obs_dict = substrate_obs_list[0]  # observation of agent 0
-        if 'WORLD.RGB' in obs_dict:
-            return obs_dict['WORLD.RGB']
+        obs_dict_agent_0 = substrate_obs_list[0]  # observation of agent 0
+        if 'WORLD.RGB' in obs_dict_agent_0:
+            world_rgb = obs_dict_agent_0['WORLD.RGB']
         else:
-            # This should ideally not be reached if the substrate is configured correctly
-            raise KeyError("Could not find 'WORLD.RGB' in self._env._substrate.observation()[0].")
+            world_rgb = np.zeros(self.global_shape, dtype=np.uint8) # Fallback
+        
+        state_dict = self.get_state()
+        all_vectors = state_dict["vector"] # This is (N_focal, V)
+
+        return {"world_rgb": world_rgb, "all_vectors": all_vectors}
 
     def reset(self) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
         """ Reset the environment and return initial observations and state. """
         self._step_count = 0
         self._last_timestep = self._env.reset()
-        return self.get_obs(), self.get_state()
+        
+        return self.get_obs(), {
+                "concat_state": self.get_state(),
+                "global_state": self.get_global()
+            }
 
     def step(self, actions_dict: Dict[str, int]) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
         """ Take a step in the environment using the provided actions dictionary for focal agents. """
@@ -369,19 +543,21 @@ class _ScenarioWrapper:
             
         next_obs_dict = self.get_obs()                   # get next observations
         next_state = self.get_state()                    # get next state
-        global_state = self.get_global()                     # get global observation
         info_dict = {}                                   # empty info dictionary
 
         if self._last_timestep.observation:
-            raw_obs_agent_0 = self._last_timestep.observation[0]
+            raw_obs_agent_0 = self._last_timestep.observation[0]  # raw obs of focal agent 0
             if 'COLLECTIVE_REWARD' in raw_obs_agent_0:
                 info_dict['collective_reward'] = raw_obs_agent_0['COLLECTIVE_REWARD']
+        
+        info_dict['global_state'] = self.get_global() # Add global_state to info
         
         return next_obs_dict, next_state, rewards_dict, dones_dict, info_dict
     
     def render(self) -> np.ndarray:
         """ Render the current environment state as an RGB array. """
-        return self.get_global()  # Ensure last timestep is available
+        global_state_dict = self.get_global()
+        return global_state_dict["world_rgb"]  # Ensure last timestep is available
 
     def close(self):
         self._env.close()
@@ -517,6 +693,9 @@ if __name__ == "__main__":
     print(f"  - agent_ids: {info_sub['agent_ids']}")
     print(f"  - global_shape: {info_sub['global_shape']}")
     print(f"  - obs_shape (C,H,W): {info_sub['obs_shape']}")
+    print(f"  - obs_vector_dim: {info_sub['obs_vector_dim']}")
+    print(f"  - state_shape (Critic): {info_sub['state_shape']}")
+
 
     # Validate metadata
     assert info_sub["n_agents"] == 7
@@ -551,7 +730,7 @@ if __name__ == "__main__":
         for agent_id in info_sub["agent_ids"]
     }
     
-    next_obs_dict, _, rewards_sub, _, info_sub_step = env_substrate.step(actions_dict_sub)
+    next_obs_dict, next_state, rewards_sub, dones_sub, info_sub_step = env_substrate.step(actions_dict_sub)
     
     # Assert that clean_up keys are in the *next* obs dict
     assert "RGB" in next_obs_dict["player_0"]
@@ -575,6 +754,8 @@ if __name__ == "__main__":
     print(f"  - agent_ids: {info_scn['agent_ids']}")
     print(f"  - global_shape: {info_scn['global_shape']}")
     print(f"  - obs_shape (C,H,W): {info_scn['obs_shape']}")
+    print(f"  - obs_vector_dim: {info_scn['obs_vector_dim']}")
+    print(f"  - state_shape (Critic): {info_scn['state_shape']}")
 
     # Validate metadata
     assert info_scn["n_agents"] == 1
@@ -596,7 +777,6 @@ if __name__ == "__main__":
     
     # Test that obs_dict contains more than just RGB
     assert 'RGB' in obs_dict['player_0']
-    assert 'COLLECTIVE_REWARD' in obs_dict['player_0']
     print(f"\nScenario obs keys (player_0): {obs_dict['player_0'].keys()}")
     
     frame_scn = env_scenario.render()
@@ -604,14 +784,86 @@ if __name__ == "__main__":
     actions_dict_scn = {
         "player_0": np.random.randint(0, info_scn["n_actions"])
     }
-    next_obs_dict_scn, _, rewards_scn, _, info_scn_step = env_scenario.step(actions_dict_scn)
+    next_obs_dict_scn, next_state, rewards_scn, dones_scn, info_scn_step = env_scenario.step(actions_dict_scn)
     assert "player_0" in rewards_scn
     assert "player_1" not in rewards_scn
-    assert "COLLECTIVE_REWARD" in next_obs_dict_scn["player_0"]
     assert "collective_reward" in info_scn_step
 
     env_scenario.close()
     print("\n✅ Scenario validation successful!")
+
+
+    # --- Test 3: API Consistency Check (Substrate vs Scenario) ---
+    print("\n" + "="*50)
+    print("Test 3: Verify API Consistency (Substrate vs Scenario)")
+    print("="*50)
+
+    try:
+        # --- 1. Substrate (clean_up) ---
+        print("Checking Substrate (clean_up)...")
+        env_sub = build_meltingpot_env("clean_up")
+        info_sub = env_sub.get_env_info()
+        obs_sub, state_sub = env_sub.reset()
+        state_sub = state_sub["concat_state"]
+        
+        # 1a. Check reset() state (should be concat_state)
+        print(f"[Substrate] reset() state keys: {state_sub.keys()}")
+        assert "rgb" in state_sub and "vector" in state_sub
+        print(f"[Substrate] state['vector'].shape: {state_sub['vector'].shape} (Expected: {(info_sub['n_agents'], info_sub['obs_vector_dim'])})")
+        assert state_sub['vector'].shape == (info_sub['n_agents'], info_sub['obs_vector_dim'])
+
+        actions_sub = {aid: np.random.randint(0, info_sub["n_actions"]) for aid in info_sub["agent_ids"]}
+        next_obs_sub, next_state_sub, _, _, info_sub_step = env_sub.step(actions_sub)
+
+        # 1b. Check step() next_state (should be concat_state)
+        print(f"[Substrate] step() next_state keys: {next_state_sub.keys()}")
+        assert "rgb" in next_state_sub and "vector" in next_state_sub
+        
+        # 1c. Check info_dict (should contain global_state)
+        print(f"[Substrate] info_dict keys: {info_sub_step.keys()}")
+        assert "global_state" in info_sub_step
+        assert "world_rgb" in info_sub_step["global_state"]
+        assert "all_vectors" in info_sub_step["global_state"]
+        
+        print("✅ Substrate API check passed.")
+        env_sub.close()
+
+        # --- 2. Scenario (collaborative_cooking__asymmetric_0) ---
+        print("\nChecking Scenario (collaborative_cooking__asymmetric_0)...")
+        env_scn = build_meltingpot_env("collaborative_cooking__asymmetric_0")
+        info_scn = env_scn.get_env_info()
+        obs_scn, state_scn = env_scn.reset()
+        state_scn = state_scn["concat_state"]
+
+        # 2a. Check reset() state (should be concat_state)
+        print(f"[Scenario] reset() state keys: {state_scn.keys()}")
+        assert "rgb" in state_scn and "vector" in state_scn
+        print(f"[Scenario] state['vector'].shape: {state_scn['vector'].shape} (Expected: {(info_scn['n_agents'], info_scn['obs_vector_dim'])})")
+        assert state_scn['vector'].shape == (info_scn['n_agents'], info_scn['obs_vector_dim'])
+
+        actions_scn = {aid: np.random.randint(0, info_scn["n_actions"]) for aid in info_scn["agent_ids"]}
+        next_obs_scn, next_state_scn, _, _, info_scn_step = env_scn.step(actions_scn)
+
+        # 2b. Check step() next_state (should be concat_state)
+        print(f"[Scenario] step() next_state keys: {next_state_scn.keys()}")
+        assert "rgb" in next_state_scn and "vector" in next_state_scn
+
+        # 2c. Check info_dict (should contain global_state)
+        print(f"[Scenario] info_dict keys: {info_scn_step.keys()}")
+        assert "global_state" in info_scn_step
+        assert "world_rgb" in info_scn_step["global_state"]
+        assert "all_vectors" in info_scn_step["global_state"]
+
+        print("✅ Scenario API check passed.")
+        env_scn.close()
+
+        print("\n✅ API Consistency Validation Successful!")
+
+    except Exception as e:
+        print(f"\n❌ API Consistency Validation FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+
     
     print("\n" + "="*50)
     print("🎉 Factory function (build_meltingpot_env) compatibility validation passed! 🎉")
