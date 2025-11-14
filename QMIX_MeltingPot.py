@@ -11,38 +11,48 @@ import torch.optim as optim
 import torch.nn as nn
 
 from utils import set_seed, plot_learning_curve
-from models import AgentDRQN, QMixer
+from models import AgentNetwork, MixerNetwork
 from memories import OffPolicyReplayBuffer
 from MeltingPotWrapper import build_meltingpot_env as GeneralMeltingPotWrapper
+from MeltingPotWrapper import _extract_vector_obs 
+
 # -------------------------------------------------------------------
 class QMIXAgent:
-    """ QMIX Agent Class """
+    """ QMIX Agent Class - Adapted for RGB + Vector """
     def __init__(self, env_info: dict, args: Dict):
         """ Initialize QMIX agent/learner. """
-        self.env_info = env_info                      # environment information dictionary
-        self.n_agents = env_info["n_agents"]          # number of agents
-        self.n_actions = env_info["n_actions"]        # number of actions
-        self.obs_shape = env_info["obs_shape"]        # observation shape (for each agent)
-        self.state_shape = env_info["state_shape"]    # global state shape
-        self.agent_ids = env_info["agent_ids"]        # list of agent IDs
+        self.env_info = env_info
+        self.n_agents = env_info["n_agents"]
+        self.n_actions = env_info["n_actions"]
+        self.agent_ids = env_info["agent_ids"]
         
-        self.args = args                               # training arguments
-        self.lr = args["lr"]                           # learning rate
-        self.gamma = args["gamma"]                     # discount factor
-        self.rnn_hidden_dim = args["rnn_hidden_dim"]   # RNN hidden dimension
-        self.mixing_embed_dim = args["mixing_embed_dim"]    # mixing network embedding dimension
-        self.grad_norm_clip = args["grad_norm_clip"]        # gradient norm clipping value
-        self.target_update_frequency = args["target_update_frequency"]     # target network update frequency
+        self.obs_rgb_shape = env_info["obs_shape"]
+        self.obs_vector_dim = env_info["obs_vector_dim"]
+        self.state_shape_dict = env_info["state_shape"]
+        
+        self.vector_keys = env_info.get("vector_keys")
+        self.discrete_scalar_map = env_info.get("discrete_scalar_map")
+        if self.vector_keys is None or self.discrete_scalar_map is None:
+            raise ValueError("env_info must contain 'vector_keys' and 'discrete_scalar_map'. \
+                             Please modify MeltingPotWrapper.py accordingly.")
+        
+        self.args = args
+        self.lr = args["lr"]
+        self.gamma = args["gamma"]
+        self.rnn_hidden_dim = args["rnn_hidden_dim"]
+        self.mixing_embed_dim = args["mixing_embed_dim"]
+        self.grad_norm_clip = args["grad_norm_clip"]
+        self.target_update_frequency = args["target_update_frequency"]
 
         self.device = torch.device(args["device"])
 
-        self.agent_network = AgentDRQN(
-            self.obs_shape, self.n_actions, self.rnn_hidden_dim
+        self.agent_network = AgentNetwork(
+            self.obs_rgb_shape, self.obs_vector_dim, self.n_actions, self.rnn_hidden_dim
         ).to(self.device)
         self.target_agent_network = copy.deepcopy(self.agent_network)
 
-        self.mixer_network = QMixer(
-            self.n_agents, self.state_shape, self.mixing_embed_dim
+        self.mixer_network = MixerNetwork(
+            self.n_agents, self.state_shape_dict, self.mixing_embed_dim
         ).to(self.device)
         self.target_mixer_network = copy.deepcopy(self.mixer_network)
 
@@ -54,36 +64,55 @@ class QMIXAgent:
 
     @torch.no_grad()
     def take_action(self, 
-                    obs_dict: Dict[str, np.ndarray], 
+                    obs_dict: Dict[str, np.ndarray], # Take action receives raw obs_dict.
                     hidden_states_dict: Dict[str, np.ndarray], 
                     epsilon: float) -> Tuple[Dict[str, int], Dict[str, np.ndarray]]:
-        """ Select Action according to the current policy (epsilon-greedy)."""
-        obs_list = [obs_dict[aid]['RGB'] for aid in self.agent_ids]        # (C, H, W)
-        hidden_list = [hidden_states_dict[aid] for aid in self.agent_ids]  # (hidden_dim,)
+        """ Select Action according to the current policy (epsilon-greedy). """
         
-        obs_batch_np = np.stack(obs_list, axis=0)           # (N, C, H, W)
-        hidden_batch_np = np.stack(hidden_list, axis=0)     # (N, hidden_dim)
+        obs_rgb_list = []
+        obs_vector_list = []
+        hidden_list = []
+        
+        for aid in self.agent_ids:
+            agent_obs = obs_dict[aid]
+            
+            obs_rgb_list.append(agent_obs['RGB'])
+            
+            agent_vector_obs = _extract_vector_obs(
+                agent_obs, self.vector_keys, self.discrete_scalar_map
+            )
+            obs_vector_list.append(agent_vector_obs)
+            
+            hidden_list.append(hidden_states_dict[aid])
 
-        obs_tensor = torch.tensor(obs_batch_np, dtype=torch.float32).unsqueeze(0).to(self.device)       # (1, N, C, H, W)
-        hidden_tensor = torch.tensor(hidden_batch_np, dtype=torch.float32).unsqueeze(0).to(self.device) # (1, N, hidden_dim)
+        obs_rgb_batch_np = np.stack(obs_rgb_list, axis=0)        # (N, C, H, W)
+        obs_vector_batch_np = np.stack(obs_vector_list, axis=0)  # (N, V)
+        hidden_batch_np = np.stack(hidden_list, axis=0)          # (N, H_dim)
+
+        # (1, N, C, H, W)
+        obs_rgb_tensor = torch.tensor(obs_rgb_batch_np, dtype=torch.float32).unsqueeze(0).to(self.device)
+        # (1, N, V)
+        obs_vector_tensor = torch.tensor(obs_vector_batch_np, dtype=torch.float32).unsqueeze(0).to(self.device)
+        # (1, N, H_dim)
+        hidden_tensor = torch.tensor(hidden_batch_np, dtype=torch.float32).unsqueeze(0).to(self.device)
 
         self.agent_network.eval() 
         
-        q_values, next_hidden_tensor = self.agent_network(obs_tensor, hidden_tensor)  # q_values: (1, N, n_actions), next_hidden_tensor: (1, N, hidden_dim)
+        q_values, next_hidden_tensor = self.agent_network(
+            obs_rgb_tensor, obs_vector_tensor, hidden_tensor
+        )
+        # q_values: (1, N, n_actions), next_hidden_tensor: (1, N, hidden_dim)
 
         actions_dict = {}
         for i, agent_id in enumerate(self.agent_ids):
-            agent_q_values = q_values[0, i, :]          # Extract the Q-value of the i-th agent -> (n_actions,)
-            
+            agent_q_values = q_values[0, i, :]
             if random.random() < epsilon:
                 action = random.randint(0, self.n_actions - 1)
             else:
                 action = agent_q_values.argmax(dim=0).item()
-                
-            actions_dict[agent_id] = action             # Store action in the dictionary
+            actions_dict[agent_id] = action
         
-        # Unpack next_hidden_tensor for storage in the environment
-        next_hidden_np = next_hidden_tensor.squeeze(0).cpu().numpy() # (N, hidden_dim)
+        next_hidden_np = next_hidden_tensor.squeeze(0).cpu().numpy()
         next_hidden_states_dict = {
             agent_id: next_hidden_np[i] for i, agent_id in enumerate(self.agent_ids)
         }
@@ -91,58 +120,79 @@ class QMIXAgent:
         return actions_dict, next_hidden_states_dict
 
     def init_hidden(self) -> Dict[str, np.ndarray]:
-        """ Return a dictionary of zero-initialized hidden states for all agents (used for environment loops) """
         return {
             agent_id: np.zeros(self.rnn_hidden_dim, dtype=np.float32)
             for agent_id in self.agent_ids
         }
         
     def _get_agent_q_values(self, 
-                            obs_batch: torch.Tensor, 
+                            obs_rgb_batch: torch.Tensor,   
+                            obs_vector_batch: torch.Tensor,
                             hidden_states: torch.Tensor, 
                             network_type: str = "main") -> Tuple[torch.Tensor, torch.Tensor]:
         """ Get the Q-values of all agents. """
         agent_net = self.agent_network if network_type == "main" else self.target_agent_network
-        return agent_net(obs_batch, hidden_states)
+        return agent_net(obs_rgb_batch, obs_vector_batch, hidden_states)
 
     def update(self, batch: Dict[str, np.ndarray]) -> float:
         """ Update the QMIX agent/learner networks. """
         self.agent_network.train() 
         self.mixer_network.train()
-        
-        states = torch.tensor(batch["state"], dtype=torch.float32).to(self.device)            # (B, L, state_dim)
-        obs = torch.tensor(batch["obs"], dtype=torch.float32).to(self.device)                 # (B, L, N, C, H, W)
-        actions = torch.tensor(batch["actions"], dtype=torch.int64).to(self.device)           # (B, L, N)
-        rewards_batch = torch.tensor(batch["rewards"], dtype=torch.float32).to(self.device)   # (B, L, N)
-        dones = torch.tensor(batch["dones"], dtype=torch.float32).to(self.device)             # (B, L)
-        next_states = torch.tensor(batch["next_state"], dtype=torch.float32).to(self.device)  # (B, L, state_dim)
-        next_obs = torch.tensor(batch["next_obs"], dtype=torch.float32).to(self.device)       # (B, L, N, C, H, W)
-        
-        B, L, N, C, H, W = obs.shape
 
-        initial_hidden = self.agent_network.init_hidden(B * N).reshape(B, N, -1).to(self.device)  # (B, N, hidden_dim)
+        obs_rgb = torch.tensor(batch["obs_rgb"], dtype=torch.float32).to(self.device)
+        obs_vector = torch.tensor(batch["obs_vector"], dtype=torch.float32).to(self.device)
+        state_rgb = torch.tensor(batch["state_rgb"], dtype=torch.float32).to(self.device)
+        state_vector = torch.tensor(batch["state_vector"], dtype=torch.float32).to(self.device)
+        
+        actions = torch.tensor(batch["actions"], dtype=torch.int64).to(self.device)
+        rewards_batch = torch.tensor(batch["rewards"], dtype=torch.float32).to(self.device)
+        dones = torch.tensor(batch["dones"], dtype=torch.float32).to(self.device)
+        
+        next_obs_rgb = torch.tensor(batch["next_obs_rgb"], dtype=torch.float32).to(self.device)
+        next_obs_vector = torch.tensor(batch["next_obs_vector"], dtype=torch.float32).to(self.device)
+        next_state_rgb = torch.tensor(batch["next_state_rgb"], dtype=torch.float32).to(self.device)
+        next_state_vector = torch.tensor(batch["next_state_vector"], dtype=torch.float32).to(self.device)
+        
+        B, L, N, C, H, W = obs_rgb.shape 
+
+        if hasattr(self.agent_network, 'init_hidden'):
+             initial_hidden = self.agent_network.init_hidden(B * N, self.device).reshape(B, N, -1)
+        else:
+             initial_hidden = torch.zeros(B, N, self.rnn_hidden_dim).to(self.device)
 
         with torch.no_grad():    # Target Q calculation
-            target_q_values, _ = self._get_agent_q_values(next_obs, initial_hidden, "target")    # (B, L, N, n_actions)
-            main_q_values_next, _ = self._get_agent_q_values(next_obs, initial_hidden, "main")   # (B, L, N, n_actions)
+            target_q_values, _ = self._get_agent_q_values(
+                next_obs_rgb, next_obs_vector, initial_hidden, "target"
+            )
+            main_q_values_next, _ = self._get_agent_q_values(
+                next_obs_rgb, next_obs_vector, initial_hidden, "main"
+            )
             
-            best_next_actions = main_q_values_next.argmax(dim=3)         # (B, L, N)
-            target_max_q_values = torch.gather(target_q_values, dim=3, index=best_next_actions.unsqueeze(3)).squeeze(3) # (B, L, N)
+            best_next_actions = main_q_values_next.argmax(dim=3)
+            target_max_q_values = torch.gather(target_q_values, dim=3, index=best_next_actions.unsqueeze(3)).squeeze(3)
             
-            target_q_total = self.target_mixer_network(target_max_q_values, next_states)    # (B, L)
+            target_q_total, _ = self.target_mixer_network( 
+                target_max_q_values, next_state_rgb, next_state_vector
+            )
+            target_q_total = target_q_total.squeeze(-1) 
             
-            rewards_sum = rewards_batch.sum(dim=2) # (B, L, N) -> (B, L)
-            td_target = rewards_sum + self.gamma * (1 - dones) * target_q_total    # (B, L)
+            rewards_sum = rewards_batch.sum(dim=2) 
+            td_target = rewards_sum + self.gamma * (1 - dones) * target_q_total    
 
         # Current Q calculation
-        main_q_values, _ = self._get_agent_q_values(obs, initial_hidden, "main")    # (B, L, N, n_actions)
-        chosen_action_q_values = torch.gather(main_q_values, dim=3, index=actions.unsqueeze(3)).squeeze(3)    # (B, L, N)
-        current_q_total = self.mixer_network(chosen_action_q_values, states)        # (B, L)
+        main_q_values, _ = self._get_agent_q_values(
+            obs_rgb, obs_vector, initial_hidden, "main"
+        )
+        chosen_action_q_values = torch.gather(main_q_values, dim=3, index=actions.unsqueeze(3)).squeeze(3)
+        
+        current_q_total, _ = self.mixer_network( 
+            chosen_action_q_values, state_rgb, state_vector
+        )
+        current_q_total = current_q_total.squeeze(-1) 
         
         # Loss
         loss = self.criterion(current_q_total, td_target)
 
-        # Optimization
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.params, self.grad_norm_clip)
@@ -159,14 +209,12 @@ class QMIXAgent:
         self.target_mixer_network.load_state_dict(self.mixer_network.state_dict())
         
     def get_networks_state_dict(self):
-        """ Get the state_dict of agent and mixer networks. """
         return {
             'agent_network': self.agent_network.state_dict(),
             'mixer_network': self.mixer_network.state_dict()
         }
 
     def load_networks_state_dict(self, state_dict):
-        """ Load the state_dict into agent and mixer networks. """
         self.agent_network.load_state_dict(state_dict['agent_network'])
         self.mixer_network.load_state_dict(state_dict['mixer_network'])
         self._update_target_networks()
@@ -184,7 +232,9 @@ def evaluate(qmix_agent: QMIXAgent,
     qmix_agent.agent_network.eval() 
 
     for _ in range(n_episodes):
-        obs_dict, state = env.reset()
+        obs_dict, state_dict = env.reset()
+        state = state_dict["concat_state"] 
+        
         hidden_states_dict = qmix_agent.init_hidden()
         done = False
         
@@ -192,10 +242,13 @@ def evaluate(qmix_agent: QMIXAgent,
             actions_dict, next_hidden_states_dict = qmix_agent.take_action(
                 obs_dict, hidden_states_dict, epsilon=0.0 # Epsilon=0
             )
+            
             next_obs_dict, next_state, rewards_dict, dones_dict, _ = env.step(actions_dict)
             done = any(dones_dict.values())
             total_reward += sum(rewards_dict.values())
+            
             obs_dict = next_obs_dict
+            state = next_state 
             hidden_states_dict = next_hidden_states_dict
             
     avg_reward = total_reward / n_episodes
@@ -205,7 +258,6 @@ def train_QMIX(qmix_agent: QMIXAgent,
                env: GeneralMeltingPotWrapper, 
                config: dict,
                replay_buffer: OffPolicyReplayBuffer) -> Tuple[List[Dict], List[Dict]]:
-    """ Train the QMIX agent. """
     print("--- Start QMIX Training ---")
     return_list: List[Dict] = []      
     return_list_eval: List[Dict] = [] 
@@ -221,34 +273,42 @@ def train_QMIX(qmix_agent: QMIXAgent,
 
     if config['learning_starts'] > 0:
         print(f"Start warming up for {config['learning_starts']} steps...")
-        obs_dict, state = env.reset()
+
+        obs_dict, state_dict = env.reset()
+        state = state_dict["concat_state"]     # {"rgb": stack..., "vector": stack...}
+        # if want use global as state, use: state = state_dict["global_state"]
+        # return {"world_rgb": ..., "all_vector": stack...}
+        
         for step in range(config['learning_starts']):
             actions_dict = {aid: random.randint(0, env.n_actions - 1) for aid in env.agent_ids}
             next_obs_dict, next_state, rewards_dict, dones_dict, info_dict = env.step(actions_dict)
             
             replay_buffer.push(obs_dict, state, actions_dict, rewards_dict, dones_dict, next_obs_dict, next_state, info_dict)
             
-            obs_dict, state = next_obs_dict, next_state
+            obs_dict, state = next_obs_dict, next_state 
             if any(dones_dict.values()): 
-                obs_dict, state = env.reset()
+                obs_dict, state_dict = env.reset()
+                state = state_dict["concat_state"]
             if (step + 1) % 1000 == 0: 
                 print(f"  Warming up {step+1}/{config['learning_starts']}...")
         print("Warming up completed.")
         total_steps = config['learning_starts']
     
     else:
-        obs_dict, state = env.reset()
+        obs_dict, state_dict = env.reset()
+        state = state_dict["concat_state"]
         hidden_states_dict = qmix_agent.init_hidden()
 
     while total_steps < config['total_timesteps']:
         """ Main training loop for QMIX agent. """
-        obs_dict, state = env.reset()
+        obs_dict, state_dict = env.reset()             # original value (not one-hot)
+        state = state_dict["concat_state"]
         hidden_states_dict = qmix_agent.init_hidden()
         done = False
         episode_return = 0.0
         episode_steps = 0
         i_episode += 1
-        
+          
         qmix_agent.agent_network.train()
         qmix_agent.mixer_network.train()
 
@@ -369,6 +429,8 @@ if __name__ == "__main__":
         multi_agent = QMIXAgent(env_info, config)
         
         print(f"Using device: {config['device']}")
+
+        train_QMIX(multi_agent, env, config, replay_buffer)
 
         single_run_data, single_run_data_eval = train_QMIX(multi_agent, env, config, replay_buffer)
         
