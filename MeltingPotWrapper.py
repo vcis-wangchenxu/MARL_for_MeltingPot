@@ -105,7 +105,7 @@ class _SubstrateWrapper:
                 self.vector_keys.append(key)
             
             elif hasattr(spec, 'shape') and hasattr(spec, 'dtype'): 
-                self.obs_vector_dim += np.prod(spec.shape) # spec.size is total elements
+                self.obs_vector_dim += int(np.prod(spec.shape)) # spec.size is total elements
                 self.vector_keys.append(key)
             
         self.vector_keys.sort()
@@ -352,7 +352,7 @@ class _ScenarioWrapper:
             # Check if it's any other array (continuous vector, bounded array, etc.)
             elif hasattr(spec, 'shape') and hasattr(spec, 'dtype'): 
                 # This is a general check for Array-like specs (e.g., shape=(3,))
-                self.obs_vector_dim += np.prod(spec.shape) # spec.size is total elements
+                self.obs_vector_dim += int(np.prod(spec.shape)) # spec.size is total elements
                 self.vector_keys.append(key)
             
             # else: key is some complex/unsupported spec, skip it
