@@ -4,11 +4,9 @@ import os
 logging.getLogger('absl').setLevel(logging.ERROR)
 
 import numpy as np
-import dm_env
 from dm_env import specs
 from typing import Dict, List, Any, Tuple
 import pygame
-import time
 
 from meltingpot import substrate
 from meltingpot import scenario
@@ -16,14 +14,12 @@ from meltingpot import scenario
 from meltingpot.configs import substrates as substrate_configs
 from meltingpot.configs import scenarios as scenario_configs
 
-VECTOR_OBS_EXCLUDE_KEYS = frozenset(['RGB', 'WORLD.RGB', 'COLLECTIVE_REWARD'])
+VECTOR_OBS_EXCLUDE_KEYS = frozenset(['RGB', 'WORLD.RGB', 'COLLECTIVE_REWARD'])    
 
 def _extract_vector_obs(obs_dict_single_agent: Dict[str, Any], 
-                        vector_keys: List[str],
-                        discrete_map: Dict[str, int]) -> np.ndarray:
+                        vector_keys: List[str]) -> np.ndarray:
     """ 
     Extract and concatenate vector observations from the observation dictionary.
-    - One-hot encodes keys found in discrete_map.
     - Flattens and concatenates other keys.
     """
     vector_parts = []
@@ -31,13 +27,8 @@ def _extract_vector_obs(obs_dict_single_agent: Dict[str, Any],
         try:
             value = obs_dict_single_agent[key]
             
-            if key in discrete_map:
-                # Key is discrete, one-hot encode it
-                num_classes = discrete_map[key]
-                vector_parts.append(_one_hot_encode(value, num_classes))
-            else:
-                # Key is continuous (or just not a discrete scalar), flatten it
-                vector_parts.append(np.asarray(value).flatten())
+            # Key is continuous (or just not a discrete scalar), flatten it
+            vector_parts.append(np.asarray(value).flatten())
 
         except KeyError:
             print(f"[Wrapper] Warning: Key '{key}' missing in observation dictionary.- Skipped.")
@@ -50,14 +41,6 @@ def _extract_vector_obs(obs_dict_single_agent: Dict[str, Any],
         return np.array([], dtype=np.float32)
         
     return np.concatenate(vector_parts, dtype=np.float32)
-
-def _one_hot_encode(value: int, num_classes: int) -> np.ndarray:
-    """Helper to create a one-hot vector."""
-    if not 0 <= value < num_classes:
-        raise ValueError(f"Value {value} is out of bounds for num_classes {num_classes}")
-    one_hot = np.zeros(num_classes, dtype=np.float32)
-    one_hot[int(value)] = 1.0
-    return one_hot
 
 class _SubstrateWrapper:
     """
@@ -78,12 +61,12 @@ class _SubstrateWrapper:
         self.agent_ids = [f"player_{i}" for i in range(self.n_agents)] # agent IDs
 
         self._action_set = self._config.action_set                # action set
-        self.n_actions = len(self._action_set)                    # number of actions (discrete)
+        self.n_actions = self._config.action_spec.num_values      # number of actions (discrete): len(self._action_set)
 
         self._env = substrate.build_from_config(self._config, roles=self._roles)
 
         lab2d_settings = self._config.lab2d_settings_builder(     # get lab2d settings
-            roles=self._roles, config=self._config
+            config=self._config, roles=self._roles
         )
         self.episode_limit = lab2d_settings.get("maxEpisodeLengthFrames", 1000) # episode limit
         self._step_count = 0
@@ -91,26 +74,18 @@ class _SubstrateWrapper:
         agent_spec = self._config.timestep_spec.observation
         
         # --- Vector observation spec (processing) ---
-        self._discrete_scalar_map = {} # Stores {key: num_classes} for one-hot
         self.obs_vector_dim = 0
-        self.vector_keys = [] # Will store all keys for the vector obs
+        self.vector_keys = []                             # Will store all keys for the vector obs
         
         for key, spec in agent_spec.items():
-            if key in VECTOR_OBS_EXCLUDE_KEYS:
+            if key in VECTOR_OBS_EXCLUDE_KEYS:    # frozenset(['RGB', 'WORLD.RGB', 'COLLECTIVE_REWARD'])
                 continue
             
-            if isinstance(spec, specs.DiscreteArray) and spec.shape == ():
-                self._discrete_scalar_map[key] = spec.num_values
-                self.obs_vector_dim += spec.num_values
-                self.vector_keys.append(key)
-            
-            elif hasattr(spec, 'shape') and hasattr(spec, 'dtype'): 
-                self.obs_vector_dim += int(np.prod(spec.shape)) # spec.size is total elements
-                self.vector_keys.append(key)
+            self.obs_vector_dim += int(np.prod(spec.shape)) # spec.size is total elements
+            self.vector_keys.append(key)
             
         self.vector_keys.sort()
         print(f"[Wrapper] Detected vector observation (Vector Obs) dimension: {self.obs_vector_dim}")
-        print(f"[Wrapper] Contained discrete (one-hot) keys: {self._discrete_scalar_map}")
         print(f"[Wrapper] All vector keys (sorted): {self.vector_keys}")
 
         # --- Handle missing RGB ---
@@ -127,8 +102,8 @@ class _SubstrateWrapper:
             self.obs_shape = None
         
         self.state_shape = {
-            "rgb": (self.n_agents,) + self.obs_shape if self.obs_shape else None,
-            "vector": (self.n_agents, self.obs_vector_dim)
+            "rgb": (self.n_agents,) + self.obs_shape if self.obs_shape else None,    # (N, C, H, W)
+            "vector": (self.n_agents, self.obs_vector_dim)                           # (N, V)
         }
         
         # --- Handle missing WORLD.RGB ---
@@ -153,7 +128,6 @@ class _SubstrateWrapper:
             "global_shape": self.global_shape,      # render shape (H, W, C)
             "episode_limit": self.episode_limit,    # episode limit
             "vector_keys": self.vector_keys,        # vector observation keys
-            "discrete_scalar_map": self._discrete_scalar_map   # discrete scalar mapping
         }
         return info
 
@@ -161,7 +135,7 @@ class _SubstrateWrapper:
     def _preprocess_obs(self, obs_dict: dict) -> dict:
         """ Preprocess observation dictionary:
             - Convert 'RGB' to (C, H, W) and normalize
-            - Remove 'WORLD.RGB' and 'COLLECTIVE_REWARD'
+            - Remove 'WORLD.RGB'
             - Pass through all other observation keys unmodified
         """
         processed_obs = {}
@@ -171,7 +145,7 @@ class _SubstrateWrapper:
                 obs_rgb /= 255.0
                 processed_obs[key] = np.transpose(obs_rgb, (2, 0, 1)) # (C, H, W)
             
-            elif key in ['COLLECTIVE_REWARD', 'WORLD.RGB']:
+            elif key in ['WORLD.RGB', 'COLLECTIVE_REWARD']:
                 # Exclude these keys from the agent's observation dict
                 pass
 
@@ -210,8 +184,7 @@ class _SubstrateWrapper:
                 rgb_list.append(agent_obs['RGB'])
             
             vector_obs = _extract_vector_obs(
-                agent_obs, self.vector_keys, self._discrete_scalar_map
-            )
+                agent_obs, self.vector_keys)
             vector_list.append(vector_obs)
 
         stacked_rgb = np.stack(rgb_list, axis=0) if rgb_list else np.array([], dtype=np.float32)           # (N, C, H, W)
@@ -232,8 +205,8 @@ class _SubstrateWrapper:
         else:
             world_rgb = np.zeros(self.global_shape, dtype=np.uint8)   # Fallback to zeros if missing                             
 
-        state_dict = self.get_state()
-        all_vectors = state_dict["vector"]
+        state_dict = self.get_state()                                 # Dict with 'rgb' and 'vector'
+        all_vectors = state_dict["vector"]                            # Numpy array of shape (N, V)
 
         return {"world_rgb": world_rgb, "all_vectors": all_vectors}
 
@@ -242,7 +215,7 @@ class _SubstrateWrapper:
         self._step_count = 0
         self._last_timestep = self._env.reset()
 
-        return self.get_obs(), {
+        return self.get_obs(), {          
             "concat_state": self.get_state(),
             "global_state": self.get_global()
         }
@@ -284,8 +257,8 @@ class _SubstrateWrapper:
 
     def render(self) -> np.ndarray:
         """ Render the current environment state as an RGB array. """
-        global_state_dict = self.get_global()
-        return global_state_dict["world_rgb"]  # Ensure last timestep is available
+        global_state_dict = self.get_global()  
+        return global_state_dict["world_rgb"]  # Ensure last timestep is available (H, W, C)
     
     def close(self):
         self._env.close()
@@ -327,7 +300,7 @@ class _ScenarioWrapper:
         self._substrate_roles = self._substrate_config.default_player_roles   # substrate roles
         
         lab2d_settings = self._substrate_config.lab2d_settings_builder(       # get lab2d settings
-            roles=self._substrate_roles, config=self._substrate_config
+            config=self._substrate_config, roles=self._substrate_roles
         )
         self.episode_limit = lab2d_settings.get("maxEpisodeLengthFrames", 1000)
         self._step_count = 0
@@ -335,31 +308,21 @@ class _ScenarioWrapper:
         agent_spec = self._obs_spec_list[0] # Spec for focal agents
 
         # --- Vector observation spec (processing) ---
-        self._discrete_scalar_map = {} # Stores {key: num_classes} for one-hot
         self.obs_vector_dim = 0
         self.vector_keys = [] # Will store all keys for the vector obs
         
         for key, spec in agent_spec.items():
-            if key in VECTOR_OBS_EXCLUDE_KEYS:
+            if key in VECTOR_OBS_EXCLUDE_KEYS:    # Not have WORLD.RGB
                 continue
-            
-            # Check if it's a discrete scalar (e.g., DiscreteArray(shape=(), num_values=2))
-            if isinstance(spec, specs.DiscreteArray) and spec.shape == ():
-                self._discrete_scalar_map[key] = spec.num_values
-                self.obs_vector_dim += spec.num_values
-                self.vector_keys.append(key)
-            
-            # Check if it's any other array (continuous vector, bounded array, etc.)
-            elif hasattr(spec, 'shape') and hasattr(spec, 'dtype'): 
-                # This is a general check for Array-like specs (e.g., shape=(3,))
-                self.obs_vector_dim += int(np.prod(spec.shape)) # spec.size is total elements
-                self.vector_keys.append(key)
+           
+            # This is a general check for Array-like specs (e.g., shape=(3,))
+            self.obs_vector_dim += int(np.prod(spec.shape)) # spec.size is total elements
+            self.vector_keys.append(key)
             
             # else: key is some complex/unsupported spec, skip it
         
         self.vector_keys.sort()
         print(f"[Wrapper] Detected vector observation (Vector Obs) dimension: {self.obs_vector_dim}")
-        print(f"[Wrapper] Contained discrete (one-hot) keys: {self._discrete_scalar_map}")
         print(f"[Wrapper] All vector keys (sorted): {self.vector_keys}")
 
         # --- Handle missing RGB ---
@@ -401,7 +364,6 @@ class _ScenarioWrapper:
             "global_shape": self.global_shape,      # render shape (H, W, C)
             "episode_limit": self.episode_limit,    # episode limit
             "vector_keys": self.vector_keys,        # vector observation keys
-            "discrete_scalar_map": self._discrete_scalar_map   # discrete scalar mapping
         }
         return info
 
@@ -420,7 +382,7 @@ class _ScenarioWrapper:
                 obs_rgb /= 255.0
                 processed_obs[key] = np.transpose(obs_rgb, (2, 0, 1)) # (C, H, W)
             
-            elif key in ['COLLECTIVE_REWARD', 'WORLD.RGB']:
+            elif key in ['COLLECTIVE_REWARD']:    # Scenario not have 'WORLD.RGB'
                 # Exclude these keys from the agent's observation dict
                 pass
 
@@ -457,12 +419,12 @@ class _ScenarioWrapper:
                 rgb_list.append(agent_obs['RGB'])
             
             vector_obs = _extract_vector_obs(
-                agent_obs, self.vector_keys, self._discrete_scalar_map
+                agent_obs, self.vector_keys
             )
             vector_list.append(vector_obs)
         
-        stacked_rgb = np.stack(rgb_list, axis=0) if rgb_list else np.array([], dtype=np.float32)
-        stacked_vector = np.stack(vector_list, axis=0) if vector_list else np.array([], dtype=np.float32)
+        stacked_rgb = np.stack(rgb_list, axis=0) if rgb_list else np.array([], dtype=np.float32)           # (N_focal, C, H, W)
+        stacked_vector = np.stack(vector_list, axis=0) if vector_list else np.array([], dtype=np.float32)  # (N_focal, V)
         
         return {
             "rgb": stacked_rgb,
@@ -725,7 +687,7 @@ if __name__ == "__main__":
     print("Test 2: Load Scenario (collaborative_cooking__asymmetric_0)")
     print("="*50)
 
-    env_scenario = build_meltingpot_env("collaborative_cooking__asymmetric_0")
+    env_scenario = build_meltingpot_env("collaborative_cooking__asymmetric_0") #  clean_up_0
 
     info_scn = env_scenario.get_env_info()
     print("Scenario environment info (get_env_info()):")
