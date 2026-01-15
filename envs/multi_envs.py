@@ -1,7 +1,7 @@
 import multiprocessing as mp
 import numpy as np
 from typing import List, Any, Callable, Union
-from MeltingPotWrapper import build_meltingpot_env
+from envs.MeltingPotWrapper import build_meltingpot_env
 
 def recursive_stack(list_of_structs: List[Any]) -> Any:
     """
