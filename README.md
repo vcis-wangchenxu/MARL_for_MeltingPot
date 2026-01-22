@@ -1,67 +1,106 @@
-# 🤖 Make Handcrafting Great Again 🔥
+# MARL for Melting Pot
 
-##  🔬 Reduce reliance on libraries (RLlib, etc.) and make algorithms more transparent
-This is a Multi-Agent Reinforcement Learning (MARL) algorithm library focused on providing clear, transparent, from-scratch implementations. We avoid heavy frameworks like RLib, ensuring all code is easy to read, modify, and understand.
----
+An implementation of Multi-Agent Reinforcement Learning (MARL) algorithms, specifically **MAPPO (Multi-Agent PPO)** and **VDN (Value Decomposition Networks)**, designed for the [DeepMind Melting Pot](https://github.com/google-deepmind/meltingpot) benchmark.
 
-All experiments are conducted on DeepMind's [MeltingPot](https://github.com/google-deepmind/meltingpot) environment.
----
+## 🚀 Features
 
-## 🍲 Core Environment: MeltingPot
-All our algorithms are experimented on MeltingPot. Before starting, please ensure you have correctly installed the environment.
-### 🛠️ Installation Guide
-1. Create a new Conda environment
+*   **Algorithms**: 
+    *   **MAPPO** (On-Policy): Cooperative PPO with Centralized Value Function.
+    *   **VDN** (Off-Policy): Value Decomposition Networks independent Q-learning with shared rewards.
+*   **Environment**: Full support for DeepMind Melting Pot substrates (e.g., `clean_up`, `collaborative_cooking`).
+*   **Vectorization**: Efficient `MeltingPotAsyncVectorEnv` for parallel environment rollouts.
+*   **Architectures**: 
+    *   **CNN + RNN**: Handles partial observability and image inputs.
+    *   **PopArt / Normalization**: Input normalization for stable training.
+*   **Logging**: Integrated with **[SwanLab](https://swanlab.cn)** for experiment tracking and visualization.
+
+## 📂 Project Structure
+
+```
+marl_for_meltingpot/
+├── algorithms/             # Algorithm implementations
+│   ├── mappo.py            # MAPPO (PPO with Centralized Critic)
+│   └── vdn.py              # VDN (Value Decomposition Networks)
+├── configs/                # Configuration files
+│   ├── mappo_meltingpot.yaml
+│   └── vdn_meltingpot.yaml
+├── envs/                   # Environment wrappers
+│   ├── MeltingPotWrapper.py   # Gym-like wrapper for Melting Pot
+│   └── multi_envs.py          # Multiprocessing VectorEnv
+├── memories/               # Experience Replay Buffers
+│   ├── ReplayBuffer.py     # For Off-Policy (VDN)
+│   └── RolloutBuffer.py    # For On-Policy (MAPPO)
+├── networks/               # Neural Network Architectures
+│   ├── DRQN.py             # Recurrent Q-Network
+│   └── MAPPO_Network.py    # Actor-Critic Networks
+├── results/                # Training outputs (models, logs)
+├── utils/                  # Utility functions
+│   ├── config.py           # Config loader
+│   ├── evaluator.py        # Evaluation logic
+│   └── util.py             # Seeding and plotting
+├── run.py                  # Main entry point for training
+├── train_offpolicy.py      # Training loop for Off-Policy
+└── train_onpolicy.py       # Training loop for On-Policy
+```
+
+## 🛠️ Installation
+
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/your-username/marl_for_meltingpot.git
+    cd marl_for_meltingpot
     ```
-    conda create -n marl_handcraft python=3.11 -y
-    conda activate marl_handcraft
+
+2.  **Install Dependencies:**
+    Ensure you have Python 3.8+ and PyTorch installed. You also need DeepMind Melting Pot.
+    ```bash
+    pip install torch numpy pygame pyyaml tqdm pandas matplotlib seaborn dm-meltingpot
+    pip install swanlab  # For logging
     ```
-    >Note: ⚠️ Python 3.11 is required. MeltingPot is built on dm_lab, which has a strict requirement for this Python version.
-2. Install the MeltingPot package From the root of the $meltingpot$ repository, run:
-    ```
-    pip install --editable .[dev]
-    ```
-3. Silence Warnings (Optional but recommended) 
 
-    Due to interference between multiple dependencies, you may see numerous $absl$ warnings. To silence these, please use the files in the Eli_Warnings folder to replace the target files in your environment.
+## 🏃 Usage
 
-## 🖥️ Hardware Requirements
-1. Devcontainer (x86 only)
-
-    NOTE: The Devcontainer provided in this project only works for x86 platforms. Users on arm64 (e.g., M1/M2/M3 Macs) must follow the manual installation steps.
-
-2. CUDA Support
-
-    To enable CUDA support (required for GPU training), ensure you have the nvidia-container-toolkit package installed.
-
-
-## 🚀 Usage
 ### Training
-You can directly run the corresponding algorithm file.
-```
-# Example: Train QMIX
-python QMIX_MeltingPot.py
-```
-> Note: Before training, please modify the env_name in the if __name__ == "__main__": block of the algorithm file (e.g., QMIX_MeltingPot.py).
 
-### Evaluation (Visualization)
-Run the evaluation file to compete against Bots or other AI agents.
-```
-# Example: Evaluate QMIX
-python Eval_MeltingPot.py
-```
-> Note: 
-    1. Before evaluating, please configure the MODEL_PATH (pointing to your trained model) and ENVS_TO_TEST (the list of environments you want to visualize) in the configuration section at the top of visualize.py;
-    2. The evaluation script is universal; it can load both Scenario (AI vs. Bot) and Substrate (AI vs. AI) environments.
+You can train agents using the `run.py` script. You must specify a configuration file using the `--config` argument.
 
-## ✅ Supported Algorithms & Environments
-Our currently implemented and verified algorithms and environments are as follows:
-<!-- | Algorithm | `collaborative_cooking__asymmetric` | `clean_up` |
-| :--- | :---: | :---: |
-| **QMIX** (Off-Policy) | ✔ | ✔ |
-| **MAPPO** (On-Policy) | ✔ | (Pending) | -->
-| Algorithm | Training | Eval | Original Paper Address | Paper Env |
-| :--- | :---: | :---: |  :---: |  :---: | 
-| **QMIX** (Off-Policy) | 'collaborative_cooking__asymmetric' | 'collaborative_cooking__asymmetric' | [Address](https://arxiv.org/abs/1803.11485) | SMAC |
-| **VDN** (Off-Policy) | 'collaborative_cooking__asymmetric' | 'collaborative_cooking__asymmetric' | [Address](https://arxiv.org/abs/1706.05296) | Switch; Fetch; Checkers |
+**Train MAPPO (On-Policy):**
+```bash
+python run.py --config configs/mappo_meltingpot.yaml
+```
 
-[![Star History Chart](https://api.star-history.com/svg?repos=vcis-wangchenxu/MARL_for_MeltingPot.git&type=date&legend=top-left)](https://www.star-history.com/#vcis-wangchenxu/MARL_for_MeltingPot.git&type=date&legend=top-left)
+**Train VDN (Off-Policy):**
+```bash
+python run.py --config configs/vdn_meltingpot.yaml
+```
+
+### Configuration (`.yaml`)
+Modify the files in `configs/` to adjust hyperparameters.
+Key parameters:
+*   `env`: The Melting Pot substrate name (e.g., `clean_up`).
+*   `algo`: Path to algorithm class (e.g., `algorithms.mappo.MAPPO`).
+*   `num_envs`: Number of parallel environments for data collection.
+*   `share_parameters`: Whether agents share weights (True/False).
+
+### Evaluation
+Evaluation runs automatically during training based on the `eval_freq` parameter in the config.
+*   Models are saved in `results/<experiment_name>/models/`.
+*   Best models are saved as `model_best.pth`.
+
+## 📊 Logging & Visualization
+
+This project uses **SwanLab** for logging metrics (Reward, Loss, Episode Length).
+*   Logs are saved in `results/logs/`.
+*   You can view training curves in the cloud if SwanLab is configured, or locally.
+
+## 🤖 Algorithms Details
+
+*   **MAPPO**: Implements PPO with a centralized value function. It uses a CNN encoder for visual observations and an optional vector encoder for other data. It supports Recurrent Neural Networks (GRU) to handle memory.
+*   **VDN**: Implements Value Decomposition Networks. It approximates the joint Q-value as the sum of individual local Q-values. It uses a DRQN (Deep Recurrent Q-Network) architecture.
+
+## 📝 Notes
+*   **Global State**: The environment wrapper automatically attempts to extract `WORLD.RGB` for centralized critics if available in the substrate.
+*   **Vector Observations**: The wrapper automatically flattens and concatenates all vector observations defined in the Melting Pot spec, excluding RGB.
+
+## 📄 License
+MIT License
