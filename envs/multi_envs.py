@@ -3,6 +3,12 @@ import numpy as np
 from typing import List, Any, Callable, Union
 from envs.MeltingPotWrapper import build_meltingpot_env
 
+def make_env_fn(env_name):
+    """ Helper to create Melting Pot environment generator. """
+    def _thunk():
+        return build_meltingpot_env(env_name)
+    return _thunk
+
 def recursive_stack(list_of_structs: List[Any]) -> Any:
     """
     Recursively stack data structures.
@@ -179,10 +185,6 @@ class MeltingPotAsyncVectorEnv:
             p.join()
 
 if __name__ == "__main__":
-    def make_env_fn(env_name):
-        def _thunk():
-            return build_meltingpot_env(env_name) 
-        return _thunk
 
     try:
         NUM_ENVS = 4
