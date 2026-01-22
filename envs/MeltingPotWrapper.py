@@ -19,11 +19,18 @@ def _extract_vector_and_stack(obs_list: List[Dict[str, Any]],
                         vector_keys: List[str]) -> np.ndarray:
     """
     Extract vector features from a list of agent observations and stack them.
-    Returns: np.ndarray of shape (N_Agents, Vector_Dim)
+
+    Args:
+        obs_list (List[Dict[str, Any]]): List of observation dictionaries for each agent.
+        vector_keys (List[str]): Keys to extract from each observation dictionary.
+
+    Returns:
+        np.ndarray: Stacked vector observations.
+            Shape: (N_Agents, Vector_Dim)
     """
     batch_vectors = []
 
-    for obs in obs_list:
+    for obs in obs_list:    # Per Agent
         flat_parts = []
         
         for key in vector_keys:
@@ -41,7 +48,15 @@ def _extract_vector_and_stack(obs_list: List[Dict[str, Any]],
 def _process_rgb_and_stack(obs_list: List[Dict[str, Any]]) -> np.ndarray:
     """
     Extract RGB images, transpose to (C, H, W), normalize, and stack.
-    Returns: np.ndarray of shape (N_Agents, C, H, W) or empty array.
+
+    Args:
+        obs_list (List[Dict[str, Any]]): List of observation dictionaries.
+
+    Returns:
+        np.ndarray: Stacked RGB observations.
+            Shape: (N_Agents, C, H, W)
+            Values are normalized to [0, 1].
+            Returns empty array if RGB not found.
     """
     processed_rgbs = []
     for obs in obs_list:
@@ -61,7 +76,13 @@ class _SubstrateWrapper:
     """ Wrapper for Melting Pot Substrate (Controls All Agents) """
     
     def __init__(self, substrate_name: str):
-        print(f"[Wrapper] Initializing Substrate: {substrate_name}...")
+        """
+        Initialize the Substrate Wrapper.
+
+        Args:
+            substrate_name (str): Name of the substrate (e.g., 'clean_up').
+        """
+        # print(f"[Wrapper] Initializing Substrate: {substrate_name}...")
         self.substrate_name = substrate_name
         self._config = substrate.get_config(self.substrate_name)
         self._roles = self._config.default_player_roles
@@ -87,32 +108,48 @@ class _SubstrateWrapper:
             self.vector_keys.append(key)
         self.vector_keys.sort()
         
-        print(f"[Wrapper] Vector keys: {self.vector_keys} | Dim: {self.obs_vector_dim}")
+        # print(f"[Wrapper] Vector keys: {self.vector_keys} | Dim: {self.obs_vector_dim}")
 
-        self.obs_shape = None
+        self.obs_rgb_shape = None
         if "RGB" in agent_spec:
-            self._obs_spec = agent_spec["RGB"]             # (C, H, W)
-            self.obs_shape = (self._obs_spec.shape[2], 
-                              self._obs_spec.shape[0], 
-                              self._obs_spec.shape[1])
+            self._obs_rgb_spec = agent_spec["RGB"]             # (C, H, W)
+            self.obs_rgb_shape = (self._obs_rgb_spec.shape[2], 
+                              self._obs_rgb_spec.shape[0], 
+                              self._obs_rgb_spec.shape[1])
 
         self.global_shape = None
         if "WORLD.RGB" in agent_spec:
             self.global_shape = agent_spec["WORLD.RGB"].shape
 
-        print(f"[Wrapper] Substrate initialized. Agents: {self.n_agents}. Obs Shape: {self.obs_shape}")
+        # print(f"[Wrapper] Substrate initialized. Agents: {self.n_agents}. Obs Shape: {self.obs_shape}")
 
     def get_env_info(self) -> dict:
+        state_shape = None
+        if self.obs_rgb_shape:
+            C, H, W = self.obs_rgb_shape
+            state_shape = (self.n_agents * C, H, W)
+
         return {
             "n_agents": self.n_agents,
             "n_actions": self.n_actions,
-            "obs_shape": self.obs_shape,             # (C, H, W)
+            "obs_rgb_shape": self.obs_rgb_shape,     # (C, H, W)
             "obs_vector_dim": self.obs_vector_dim,   # Vector Dim
-            "global_shape": self.global_shape        # (H, W, C)
+            "global_shape": self.global_shape,       # (H, W, C)
+            "state_shape": state_shape               # (N*C, H, W) or None
         }
 
     def _format_obs(self, timestep) -> Dict[str, np.ndarray]:
-        """ Converts timestep.observation list -> Stacked Dict of Arrays """
+        """ 
+        Convert timestep observation into standard dictionary format.
+        
+        Args:
+            timestep: dm_env timestep object containing observations.
+
+        Returns:
+            Dict[str, np.ndarray]:
+                - "rgb": (N_Agents, C, H, W)
+                - "vector": (N_Agents, Vector_Dim)
+        """
         obs_list = timestep.observation
         
         return {
@@ -126,18 +163,32 @@ class _SubstrateWrapper:
         
         obs = self._format_obs(self._last_timestep)
         info = {} 
+
+        if self._last_timestep.observation:
+            raw_obs_0 = self._last_timestep.observation[0]
+
+            if self.global_shape and 'WORLD.RGB' in raw_obs_0:
+                info['global_state'] = {'world_rgb': raw_obs_0['WORLD.RGB']}
+            if 'COLLECTIVE_REWARD' in raw_obs_0:
+                info['collective_reward'] = raw_obs_0['COLLECTIVE_REWARD']
         
         return obs, info
 
     def step(self, actions: Union[List[int], np.ndarray]) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, Dict]:
         """
+        Take a step in the environment.
+
         Args:
-            actions: List or Array of ints, shape (N_Agents,)
+            actions (Union[List[int], np.ndarray]): Actions for each agent.
+                Shape: (N_Agents,)
+
         Returns:
-            obs: {'rgb': (N, C, H, W), 'vector': (N, V)}
-            rewards: (N,)
-            dones: (N,)
-            info: Dict containing global_state, etc.
+            obs (Dict[str, np.ndarray]): Next observations.
+                - 'rgb': (N_Agents, C, H, W)
+                - 'vector': (N_Agents, Vector_Dim)
+            rewards (np.ndarray): Reward for each agent. Shape (N_Agents,).
+            dones (np.ndarray): Termination flag (shared). Shape (N_Agents,).
+            info (Dict): Info dictionary containing 'global_state', 'collective_reward', etc.
         """
         # Ensure actions is a list for dm_env
         if isinstance(actions, np.ndarray):
@@ -167,6 +218,13 @@ class _SubstrateWrapper:
         return obs, rewards, dones, info
 
     def render(self) -> np.ndarray:
+        """
+        Render the global state of the environment.
+
+        Returns:
+            np.ndarray: RGB image of the global world state.
+                Shape: (H, W, C), usually (Height, Width, 3).
+        """
         if self._last_timestep is None:
             raise RuntimeError("Call reset() first")
         return self._last_timestep.observation[0].get('WORLD.RGB', np.zeros(self.global_shape, dtype=np.uint8))
@@ -178,7 +236,13 @@ class _ScenarioWrapper:
     """ Wrapper for Melting Pot Scenario (Controls Focal Agents Only) """
     
     def __init__(self, scenario_name: str):
-        print(f"[Wrapper] Initializing Scenario: {scenario_name}...")
+        """
+        Initialize the Scenario Wrapper.
+
+        Args:
+            scenario_name (str): Name of the scenario (e.g., 'collaborative_cooking__asymmetric').
+        """
+        # print(f"[Wrapper] Initializing Scenario: {scenario_name}...")
         self.scenario_name = scenario_name
         self._config = scenario.get_config(scenario_name)
         self._env = scenario.build(scenario_name)
@@ -199,12 +263,12 @@ class _ScenarioWrapper:
             self.obs_vector_dim += int(np.prod(spec.shape))
             self.vector_keys.append(key)
         self.vector_keys.sort()
-        print(f"[Wrapper] Vector keys: {self.vector_keys} | Dim: {self.obs_vector_dim}")
+        # print(f"[Wrapper] Vector keys: {self.vector_keys} | Dim: {self.obs_vector_dim}")
 
-        self.obs_shape = None
+        self.obs_rgb_shape = None
         if "RGB" in agent_spec:
             s = agent_spec["RGB"]
-            self.obs_shape = (s.shape[2], 
+            self.obs_rgb_shape = (s.shape[2], 
                               s.shape[0], 
                               s.shape[1])
 
@@ -216,15 +280,30 @@ class _ScenarioWrapper:
         print(f"[Wrapper] Scenario initialized. Focal Agents: {self.n_agents}")
 
     def get_env_info(self) -> dict:
+        state_shape = None
+        if self.obs_rgb_shape:
+            C, H, W = self.obs_rgb_shape
+            state_shape = (self.n_agents * C, H, W)
+            
         return {
             "n_agents": self.n_agents,
             "n_actions": self.n_actions,
-            "obs_shape": self.obs_shape,
+            "obs_rgb_shape": self.obs_rgb_shape,
             "obs_vector_dim": self.obs_vector_dim,
-            "global_shape": self.global_shape
+            "global_shape": self.global_shape,
+            "state_shape": state_shape
         }
 
     def _format_obs(self, timestep) -> Dict[str, np.ndarray]:
+        """ 
+        Convert timestep observation into standard dictionary format.
+        
+        Args:
+            timestep: dm_env timestep object.
+
+        Returns:
+            Dict[str, np.ndarray]: Stacked observations for focal agents.
+        """
         # timestep.observation only contains focal agents in Scenario
         obs_list = timestep.observation
         return {
@@ -233,6 +312,12 @@ class _ScenarioWrapper:
         }
 
     def _get_world_rgb(self) -> np.ndarray:
+        """
+        Retrieve global WORLD.RGB observation from the underlying substrate.
+
+        Returns:
+            np.ndarray: Global RGB observation with shape (H, W, C), or None if unavailable.
+        """
         # Hack to get global state in Scenario
         try:
             return self._env._substrate.observation()[0]['WORLD.RGB']
@@ -240,15 +325,39 @@ class _ScenarioWrapper:
             return np.zeros(self.global_shape, dtype=np.uint8) if self.global_shape else None
 
     def reset(self) -> Tuple[Dict[str, np.ndarray], Dict]:
+        """
+        Reset the scenario environment.
+
+        Returns:
+            obs (Dict[str, np.ndarray]): Initial observations for focal agents.
+            info (Dict): Initial info dictionary.
+        """
         self._step_count = 0
         self._last_timestep = self._env.reset()
 
         obs = self._format_obs(self._last_timestep)
         info = {}
 
+        if self._last_timestep.observation:
+            raw_obs_0 = self._last_timestep.observation[0]
+
+            if self.global_shape and 'WORLD.RGB' in raw_obs_0:
+                info['global_state'] = {'world_rgb': raw_obs_0['WORLD.RGB']}
+            if 'COLLECTIVE_REWARD' in raw_obs_0:
+                info['collective_reward'] = raw_obs_0['COLLECTIVE_REWARD']
+
         return obs, info
 
     def step(self, actions: Union[List[int], np.ndarray]) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, Dict]:
+        """
+        Step the scenario environment.
+        
+        Args:
+            actions (Union[List[int], np.ndarray]): Actions for focal agents.
+        
+        Returns:
+            obs, rewards, dones, info (formatted for Multi-Agent RL)
+        """
         if isinstance(actions, np.ndarray):
             actions = actions.tolist()
             
@@ -278,6 +387,12 @@ class _ScenarioWrapper:
         return obs, rewards, dones, info
 
     def render(self) -> np.ndarray:
+        """
+        Render the global state of the environment.
+
+        Returns:
+            np.ndarray: RGB image of the global world state (H, W, C).
+        """
         return self._get_world_rgb()
 
     def close(self):
@@ -287,6 +402,15 @@ def build_meltingpot_env(env_name: str):
     """
     Constructs a Melting Pot environment (either Substrate or Scenario)
     and returns a wrapper providing a unified API interface.
+
+    Args:
+        env_name (str): Name of the environment (substrate or scenario).
+
+    Returns:
+        Union[_SubstrateWrapper, _ScenarioWrapper]: An initialized environment wrapper.
+    
+    Raises:
+        ValueError: If env_name is not found in known configs.
     """
 
     # Check if env_name is in the imported SUBSTRATES collection
