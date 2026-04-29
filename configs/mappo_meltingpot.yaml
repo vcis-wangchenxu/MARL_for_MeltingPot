@@ -1,0 +1,37 @@
+env: clean_up
+algo: algorithms.mappo.MAPPO
+policy_type: on-policy
+
+seeds: [1, 42, 100]
+device: cuda
+
+# --- Training Parameters ---
+num_envs: 8
+max_steps: 10000000
+buffer_size: 128        # Rollout length
+batch_size: 4           # Mini-batches per epoch
+ppo_epoch: 10           # Updates per rollout
+clip_param: 0.2
+gae_lambda: 0.95
+entropy_coef: 0.01
+value_loss_coef: 0.5
+max_grad_norm: 10.0
+use_clipped_value_loss: True
+
+# --- Network Parameters ---
+hidden_dim: 128
+rnn_layers: 1
+share_parameters: True
+
+# --- Optimization ---
+lr: 5.0e-4
+eps: 1.0e-5
+gamma: 0.99
+
+# --- Logging ---
+run_dir: ./results
+project_name: MeltingPot-MARL
+log_freq: 10
+eval_freq: 5000
+eval_episodes: 5
+use_swanlab: True
